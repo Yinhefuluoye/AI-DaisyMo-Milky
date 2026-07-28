@@ -1,6 +1,6 @@
--*- CSDN: Daisy-Mo   -*-
--*- GitHub: Rosysuki -*-
--*- 贴吧: Daisy-Mo   -*-
+<div align="center">
+  <img src="./icon.png" alt="Logo"/>
+</div>
 
 ⭐⭐⭐前排提醒：必须读下面的注意事项的第五条！！！
 
@@ -11,7 +11,9 @@ GitHub地址：https://github.com/Rosysuki/AI-DaisyMo/
 
 支持平台：Windows（.exe）
 
-项目发起者/维护者：GitHub:Rosysuki
+项目发起者/维护者：Rosysuki[Github], Lulianovic[Github]
+
+感谢贡献，希望这个项目可以越来越好！
 
 
 # 声明：
