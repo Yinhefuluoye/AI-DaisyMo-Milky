@@ -494,6 +494,7 @@ class Screen(object):
         self.mixer.air()
 
 
+    # 标题开场动画与点击进入提示
     def title(self) -> Self:
         player: VideoCapture = VideoCapture("assets/ui/title_end_m.wmv")
         is_opened: bool = player.isOpened()
@@ -528,8 +529,13 @@ class Screen(object):
 
         pygame.event.clear()
         while is_running:
-            
+
             for event in pygame.event.get():
+
+                if event.type == QUIT:
+                    self.mixer.exit()
+                    pygame.quit()
+                    sys_exit()
 
                 if event.type == MOUSEBUTTONDOWN or event.type == KEYDOWN:
                     is_running = False
@@ -683,6 +689,7 @@ class Screen(object):
         self.update_player_input_rect('')
 
 
+    # 主对话界面（含立绘、文本逐字显示、玩家输入与主循环）
     def main(self) -> NoReturn:
         run: bool                 = True
         script: Dict[str, str]    = None
@@ -853,6 +860,7 @@ class Screen(object):
         pygame.quit()
 
 
+    # 页面：首次进入时输入 API-Key 的弹窗
     def ask_api_key(self, back: pygame.SurfaceType, title: str = "初次进入，需输入Api-Key") -> str:
         asking: bool = True
         inputing: bool = False
@@ -860,54 +868,142 @@ class Screen(object):
 
         Screen.font.set_bold(1)
 
+        # 顶部提示文字 - 屏幕 1/3 高度
         hint_text: pygame.SurfaceType = Screen.font.render(title, True, BCOLOR)
         hint_pos: List[int, int] = [
             (self.screen.get_width() - hint_text.get_width()) // 2,
-            (self.screen.get_height() - hint_text.get_height()) // 3
+            self.screen.get_height() // 3
         ]
-        api_key_text: pygame.SurfaceType = Screen.font.render(api_key, True, DCOLOR)
-        api_key_pos: List[int, int] = [
-            (self.screen.get_width() - api_key_text.get_width()) // 2,
-            (self.screen.get_height() - api_key_text.get_height()) // 2
-        ]
-        click_text: pygame.SurfaceType = Screen.font.render("<点击屏幕唤醒键盘>", True, DCOLOR)
+        # 唤醒键盘提示 - 紧贴在提示文字下方
+        click_text: pygame.SurfaceType = Screen.font.render("<点击屏幕唤醒键盘>", True, BCOLOR)
         click_pos: Tuple[2] = (
             (self.screen.get_width() - click_text.get_width()) // 2,
-            (self.screen.get_height() - click_text.get_height()) // 4
+            self.screen.get_height() // 3 + hint_text.get_height() + 10
         )
+
+        # API Key 文字渲染在主对话框 main_botm 内部（按宽度自动换行）
+        api_key_rects: List[Tuple[pygame.SurfaceType, Tuple[int, int]]] = []
+        def _refresh_api_key() -> None:
+            nonlocal api_key_rects
+            lines: List[str] = self.wrap_text(api_key, self.main_botm.get_width() - 40)
+            total_h: int = len(lines) * Screen.font.get_height()
+            base_y: int = self.main_botm_pos[1] + (self.main_botm.get_height() - total_h) // 2
+            api_key_rects = [
+                (
+                    Screen.font.render(line, True, DCOLOR),
+                    (self.main_botm_pos[0] + 20, base_y + i * Screen.font.get_height())
+                )
+                for i, line in enumerate(lines)
+            ]
+        _refresh_api_key()
+
+        # 长按删除：首次按下立即删一格；超过延迟后按间隔连续删
+        backspace_held: bool         = False
+        backspace_hold_start: float  = 0.0
+        backspace_last_delete: float = 0.0
+        BS_REPEAT_DELAY: float       = 0.5     # 长按 500ms 后开始连删
+        BS_REPEAT_INTERVAL: float    = 0.05    # 连删时每 50ms 删一格
+
+        # 光标闪烁 |：inputing 时显示，0.5s 切换一次可见性
+        cursor_visible: bool  = True
+        last_blink_time: float = time()
+        BLINK_INTERVAL: float = 0.5
 
         while asking:
 
             for event in pygame.event.get():
 
+                if event.type == QUIT:
+                    self.mixer.exit()
+                    pygame.quit()
+                    sys_exit()
+
                 if event.type == MOUSEBUTTONDOWN:
                     if platform == "linux":
                         pygame.key.start_text_input()
-                    inputing = True
+                    if not inputing:
+                        inputing = True
+                        hint_text = Screen.font.render("请在下方对话框内输入Api-Key后回车（可使用Ctrl+V粘贴）", True, BCOLOR)
+                        hint_pos[0] = (self.screen.get_width() - hint_text.get_width()) // 2
+                        hint_pos[1] = self.main_botm_pos[1] - hint_text.get_height() - 50
 
                 elif event.type == TEXTINPUT and inputing:
                     api_key += event.text
-                    api_key_text = Screen.font.render(api_key, True, DCOLOR)
-                    api_key_pos[0] = (self.screen.get_width() - api_key_text.get_width()) // 2
+                    _refresh_api_key()
 
                 elif event.type == KEYDOWN:
                     if event.key in (K_DELETE, K_BACKSPACE):
-                        api_key = api_key[: -1]
-                        api_key_text = Screen.font.render(api_key, True, DCOLOR)
-                        api_key_pos[0] = (self.screen.get_width() - api_key_text.get_width()) // 2
+                        # 首次按下立即删一格，并标记进入长按状态
+                        if not backspace_held and api_key:
+                            api_key = api_key[: -1]
+                            _refresh_api_key()
+                            backspace_held = True
+                            backspace_hold_start = time()
+                            backspace_last_delete = time()
+
+                    elif (pygame.key.get_mods() & KMOD_CTRL) and event.key == K_v:
+                        pasted: str = ''
+                        try:
+                            import tkinter as tk
+                            _tk: tk.Tk = tk.Tk()
+                            _tk.withdraw()
+                            _tk.update()
+                            pasted = _tk.clipboard_get()
+                            _tk.destroy()
+                        except Exception as e:
+                            debug("粘贴失败", f"clipboard_get: {e}")
+                        if pasted:
+                            pasted = pasted.strip().replace('\n', '').replace('\r', '').replace('\t', '')
+                            api_key += pasted
+                            _refresh_api_key()
 
                     elif event.key == K_RETURN:
                         if platform == "linux":
                             pygame.key.stop_text_input()
                         inputing = asking = False
 
+                elif event.type == KEYUP and event.key in (K_DELETE, K_BACKSPACE):
+                    backspace_held = False
+
+            # 长按连删：过了初始延迟后按 BS_REPEAT_INTERVAL 持续删
+            if backspace_held and inputing and api_key:
+                now: float = time()
+                if now - backspace_hold_start >= BS_REPEAT_DELAY:
+                    if now - backspace_last_delete >= BS_REPEAT_INTERVAL:
+                        api_key = api_key[: -1]
+                        _refresh_api_key()
+                        backspace_last_delete = now
+                # 兜底：KEYUP 事件不可靠时，用键盘状态自检
+                keys = pygame.key.get_pressed()
+                if not (keys[K_BACKSPACE] or keys[K_DELETE]):
+                    backspace_held = False
+
+            # 光标闪烁
+            if inputing and time() - last_blink_time >= BLINK_INTERVAL:
+                cursor_visible = not cursor_visible
+                last_blink_time = time()
+
             self.screen.blits(
                 (
                     (back, (0, 0)),
+                    (self.main_botm, self.main_botm_pos),
                     (hint_text, hint_pos),
-                    (api_key_text, api_key_pos)
+                    *api_key_rects
                 )
             )
+
+            # 渲染闪烁光标 | ：紧贴 api_key 末尾
+            if inputing and cursor_visible:
+                if api_key_rects:
+                    last_surf, (lx, ly) = api_key_rects[-1]
+                    cursor_x: int = lx + last_surf.get_width()
+                    cursor_y: int = ly
+                else:
+                    # api_key 为空时光标显示在对话框起始位置
+                    cursor_y = self.main_botm_pos[1] + (self.main_botm.get_height() - Screen.font.get_height()) // 2
+                    cursor_x = self.main_botm_pos[0] + 20
+                cursor_surf: pygame.SurfaceType = Screen.font.render('|', True, DCOLOR)
+                self.screen.blit(cursor_surf, (cursor_x, cursor_y))
 
             if not inputing:
                 self.screen.blit(click_text, click_pos)
@@ -919,6 +1015,7 @@ class Screen(object):
         return b64encode(api_key.encode()).decode()
     
 
+    # 历史对话回顾
     def history_menu(self) -> NoReturn:
         screen_width, screen_height = self.screen.get_size()
 
@@ -937,7 +1034,10 @@ class Screen(object):
             for event in pygame.event.get():
 
                 if event.type == QUIT:
-                    running = False
+                    self.daisymo.save()
+                    self.mixer.exit()
+                    pygame.quit()
+                    sys_exit()
 
                 elif event.type == MOUSEBUTTONDOWN:
                     x, y = event.pos
