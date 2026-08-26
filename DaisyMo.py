@@ -36,7 +36,8 @@ from collections import (
     deque
 )
 from threading import (
-    Thread
+    Thread,
+    Lock
 )
 from sys import (
     platform,
@@ -48,7 +49,8 @@ from json import (
 )
 from os import (
     path as os_path,
-    listdir
+    listdir,
+    replace as os_replace
 )
 from random import (
     choice,
@@ -113,6 +115,12 @@ class DaisyMo(object):
 
     random_back_cache: List[str] = []
 
+    last_usage: Dict[str, int]  = {}
+
+    total_usage: int            = 0
+
+    save_lock: Lock             = Lock()
+
     def __init__(daisymo, ask_api_key: Callable[[], str]) -> NoReturn:
         if not DaisyMo.first_meet:
             with open("assets/key", 'r', encoding="utf-8") as api_key_file:
@@ -141,9 +149,20 @@ class DaisyMo(object):
         # if not __DEBUG__ and DaisyMo.first_meet:
         #     daisymo.save()
 
-        if daisymo_soul[0] == '[':
-            #daisymo.load(daisymo_soul)
-            return daisymo.next(daisymo.last_chat(daisymo.parse(daisymo_soul)))
+        try:
+            if daisymo_soul[0] == '[':
+                #daisymo.load(daisymo_soul)
+                return daisymo.next(daisymo.last_chat(daisymo.parse(daisymo_soul)))
+
+        except Exception as e:
+            # 存档损坏（空文件/半截JSON）：备份坏档后回退模板重新开局，不再直接崩
+            debug("存档损坏", f"in init with error: {e}")
+
+            os_replace(soul_file_path, soul_file_path + ".corrupt.bak")
+            copyfile("DaisyMo.soul", soul_file_path)
+
+            with open(soul_file_path, 'r', encoding="utf-8") as daisymo_soul_file:
+                daisymo_soul = daisymo_soul_file.read().strip()
 
         seed(BIRTH)
 
@@ -187,8 +206,13 @@ class DaisyMo(object):
             DaisyMo.memory.pop()
             return ''
                 
-        respond: str = response.json()["choices"][0]["message"]["content"].replace('```json', '').replace('```', '')
+        response_json: Dict = response.json()
+
+        respond: str = response_json["choices"][0]["message"]["content"].replace('```json', '').replace('```', '')
         DaisyMo.memory.append({"role": "assistant", "content": respond})
+
+        DaisyMo.last_usage = response_json.get("usage", {})
+        DaisyMo.total_usage += DaisyMo.last_usage.get("total_tokens", 0)
 
         if __DEBUG__:
             print('= ' * 10)
@@ -272,9 +296,17 @@ class DaisyMo(object):
 
     def save(daisymo) -> bool:
         save_file_path: str = "assets/DaisyMo.soul"
+        temp_file_path: str = "assets/DaisyMo.soul.tmp"
 
-        with open(save_file_path, 'w', encoding="utf-8") as save_file:
-            save_file.write(json_dumps(DaisyMo.memory))
+        # 加锁防 auto_save 线程与退出时的 save 并发写；快照防遍历途中主线程 append
+        with DaisyMo.save_lock:
+            soul: str = json_dumps(DaisyMo.memory[:])
+
+            # 先写临时文件再原子替换：任何时刻被打断，磁盘上都是完整的旧档或新档
+            with open(temp_file_path, 'w', encoding="utf-8") as save_file:
+                save_file.write(soul)
+
+            os_replace(temp_file_path, save_file_path)
 
         return 1
 
@@ -404,7 +436,7 @@ class DaisyMo(object):
 
         return hsurf
 
-
+# 音乐播放组件
 class Mixer(object):
 
     pointer: int = -1
@@ -425,7 +457,38 @@ class Mixer(object):
     def exit(self) -> NoReturn:
         pygame.mixer.music.stop()
 
+# 闪烁光标组件
+class BlinkCursor(object):
 
+    BLINK_INTERVAL: float = 0.5
+
+    def __init__(self) -> NoReturn:
+        self.visible: bool      = True
+        self.last_blink_time: float = time()
+
+
+    def tick(self) -> NoReturn:
+        if time() - self.last_blink_time >= BlinkCursor.BLINK_INTERVAL:
+            self.visible = not self.visible
+            self.last_blink_time = time()
+
+            # 渲染闪烁光标 | ：紧贴 player_input 末尾
+    def draw(self, surface: pygame.SurfaceType, font: pygame.font.FontType, color: Tuple[int, int, int], rects: List[Tuple[pygame.SurfaceType, Tuple[int, int]]], fallback_rect: Tuple[int, int]) -> NoReturn:
+        if not self.visible:
+            return
+
+        if rects:
+            last_surf, (lx, ly) = rects[-1]
+            cursor_x: int = lx + last_surf.get_width()
+            cursor_y: int = ly
+        else:
+            # 输入为空时光标显示在 fallback_rect 位置
+            cursor_x, cursor_y = fallback_rect
+
+        cursor_surf: pygame.SurfaceType = font.render('|', True, color)
+        surface.blit(cursor_surf, (cursor_x, cursor_y))
+
+# 屏幕组件
 class Screen(object):
 
     default_size: Tuple[int, int]         = (1280, 720)
@@ -660,7 +723,7 @@ class Screen(object):
             )
             Screen.fast_text_rects.append((surf, rect))
 
-        Screen.text_rect = Screen.fast_text_rects[0][1] if Screen.fast_text_rects else (0, 0)
+        Screen.text_rect = Screen.fast_text_rects[0][1] if Screen.fast_text_rects else ((Screen.default_size[0]) // 2, base_y)
 
 
     def update_player_input_rect(self, player_input: str) -> NoReturn:
@@ -668,7 +731,7 @@ class Screen(object):
         Screen.player_input_rects = []
 
         lines = self.wrap_text(player_input, Screen.default_size[0] - 100)
-        base_y = Screen.default_size[1] - len(lines) * Screen.font.get_height() - 20
+        base_y = Screen.default_size[1] - (len(lines) if lines else 1) * Screen.font.get_height() - 20
         x = Screen.text_rect[0]
 
         for index, line in enumerate(lines):
@@ -695,11 +758,14 @@ class Screen(object):
         script: Dict[str, str]    = None
         player_input: str         = ''
         root: int                 = DAISYMO
-        input_active: bool        = False
+        input_active: bool        = True
         clock: pygame.time.Clock  = pygame.time.Clock()
         # last_chat_time: float     = 0.0
         # random_change_time: float = 1000
         x = y = 0
+
+        # 光标组件
+        blink: BlinkCursor = BlinkCursor()
 
         script = self.daisymo.init()
         self.daisymo.update_default_size().update_offset_center()
@@ -757,6 +823,21 @@ class Screen(object):
                 DCOLOR
             )
 
+            # Token 用量：上次请求的上下文长度（本次消耗 / 会话累计）
+            token_text = Screen.dfont.render(
+                "上下文: {} tokens（本次 +{} / 累计 {}）".format(
+                    DaisyMo.last_usage.get("prompt_tokens", 0),
+                    DaisyMo.last_usage.get("total_tokens", 0),
+                    DaisyMo.total_usage
+                ),
+                True,
+                DCOLOR
+            )
+            token_pos = (
+                self.screen.get_width() - token_text.get_width() - 10,
+                self.screen.get_height() - token_text.get_height() - 5
+            )
+
             clock.tick(Screen.FPS)
             self.step_typewriter()
 
@@ -785,7 +866,6 @@ class Screen(object):
                         debug("log", "key return for chat")
                         if platform == "linux":
                             pygame.key.stop_text_input()
-                        input_active = False
 
                         self.daisymo.chat_then_parse(player_input)
                         self.start_typewriter(DaisyMo.text)
@@ -812,7 +892,7 @@ class Screen(object):
                     elif event.key == K_3:
                         self.daisymo.random_back()
 
-                elif event.type == TEXTINPUT and input_active:
+                elif event.type == TEXTINPUT:
                     player_input += event.text
                     self.update_player_input_rect(player_input)
                     debug("log", f"TEXTINPUT current player_input: {player_input}")
@@ -828,6 +908,12 @@ class Screen(object):
 
             #self.unsafe_update()
             self.update()
+
+            # 光标闪烁
+            blink.tick()
+
+            # 渲染闪烁光标 | ：紧贴 player_input 末尾
+            blink.draw(self.screen, Screen.qfont, QCOLOR, Screen.player_input_rects, Screen.player_input_rect)
 
             if bug_rect[0] <= x <= bug_rect[2] and bug_rect[1] <= y <= bug_rect[3]:
                 self.screen.blits(
@@ -848,6 +934,8 @@ class Screen(object):
                 self.screen.blit(history_normal, history_rect[: 2])
             else:
                 self.screen.blit(history_over, history_rect[: 2])
+
+            self.screen.blit(token_text, token_pos)
 
             pygame.display.flip()
 
@@ -904,10 +992,8 @@ class Screen(object):
         BS_REPEAT_DELAY: float       = 0.5     # 长按 500ms 后开始连删
         BS_REPEAT_INTERVAL: float    = 0.05    # 连删时每 50ms 删一格
 
-        # 光标闪烁 |：inputing 时显示，0.5s 切换一次可见性
-        cursor_visible: bool  = True
-        last_blink_time: float = time()
-        BLINK_INTERVAL: float = 0.5
+        # 闪烁光标 |：inputing 时显示，0.5s 切换一次可见性
+        blink: BlinkCursor = BlinkCursor()
 
         while asking:
 
@@ -979,9 +1065,7 @@ class Screen(object):
                     backspace_held = False
 
             # 光标闪烁
-            if inputing and time() - last_blink_time >= BLINK_INTERVAL:
-                cursor_visible = not cursor_visible
-                last_blink_time = time()
+            blink.tick()
 
             self.screen.blits(
                 (
@@ -993,17 +1077,12 @@ class Screen(object):
             )
 
             # 渲染闪烁光标 | ：紧贴 api_key 末尾
-            if inputing and cursor_visible:
-                if api_key_rects:
-                    last_surf, (lx, ly) = api_key_rects[-1]
-                    cursor_x: int = lx + last_surf.get_width()
-                    cursor_y: int = ly
-                else:
-                    # api_key 为空时光标显示在对话框起始位置
-                    cursor_y = self.main_botm_pos[1] + (self.main_botm.get_height() - Screen.font.get_height()) // 2
-                    cursor_x = self.main_botm_pos[0] + 20
-                cursor_surf: pygame.SurfaceType = Screen.font.render('|', True, DCOLOR)
-                self.screen.blit(cursor_surf, (cursor_x, cursor_y))
+            if inputing:
+                cursor_fallback: Tuple[int, int] = (
+                    self.main_botm_pos[0] + 20,
+                    self.main_botm_pos[1] + (self.main_botm.get_height() - Screen.font.get_height()) // 2
+                )
+                blink.draw(self.screen, Screen.font, DCOLOR, api_key_rects, cursor_fallback)
 
             if not inputing:
                 self.screen.blit(click_text, click_pos)
