@@ -1,6 +1,6 @@
 {
   "provider": "deepseek",
-  "base_url": "https://api.deepseek.com/v1",
+  "base_url": "https://api.deepseek.com",
   "model": "deepseek-v4-pro",
   "api_key": "",
   "tts_base_url": "http://localhost:9880",

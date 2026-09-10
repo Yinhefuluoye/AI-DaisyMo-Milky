@@ -7,6 +7,10 @@ assets/key
 *.pem
 .env
 .env.*
+Apikey.txt
+*apikey*
+*APIKEY*
+*ApiKey*
 
 # ==============================================================================
 # 用户运行数据与本地动态缓存 (User Data & Runtime Caches)
@@ -68,6 +72,9 @@ title-prototype.html
 ui-prototype.html
 MEMORY.md
 direction-approved.md
+*报告*.md
+*调研*.md
+*排查*.md
 preview_thinking_*.png
 verified_*.png
 hero_icon_*.png

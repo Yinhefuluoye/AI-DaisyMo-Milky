@@ -28,9 +28,9 @@
 
 - **界面视觉还原**：重构官方三层底框样式，支持 2x SSAA 抗锯齿超采样进入主键、消融转场与回忆（Backlog）珍藏分栏。
 - **语料蒸馏心智设定**：基于 6,397 句官方剧本原案对话提炼角色提示词，规范语气节律与动作表情映射。
-- **深度思考能力适配**：自动识别模型是否具备推理能力（如 mimo-v2.5、deepseek-reasoner 等），支持开启、关闭与置灰禁用三态；关闭时显式降低延迟，实现 2 秒级响应。
-- **TTS 语音合成支持**：内置双协议适配器，兼容标准 OpenAI 协议与小米 MiMo 语音端点。
-- **多模型服务商接入**：提供小米 MiMo、DeepSeek、Claude、OpenAI、Gemini、通义千问等服务商预设及自定义端点配置。
+- **深度思考能力适配**：自动识别模型是否具备推理能力（如 deepseek-v4-pro、hy3、mimo-v2.5-pro 等），支持开启、关闭与置灰禁用三态；关闭时显式降低延迟，实现 2 秒级响应。
+- **TTS 语音合成支持**：内置双协议适配器，兼容标准 OpenAI 协议与小米 MiMO 语音端点。
+- **多模型服务商接入**：提供小米 MiMO、DeepSeek、Claude、OpenAI、Gemini、通义千问、腾讯混元、百度千帆等服务商预设及自定义端点配置。
 
 ---
 
@@ -80,11 +80,14 @@
 
 | 服务商 | 模型示例 | 接入方式 | 实测状态 | 说明 |
 | :--- | :--- | :--- | :--- | :--- |
-| **小米 MiMo** | mimo-v2.5 | 官方兼容接口 | **已充分测试** | 支持深度思考开关，关闭思考后响应调优至 2 秒级 |
-| **DeepSeek** | deepseek-chat | 官方兼容接口 | **基础验证** | 基础对话流程已调通 |
-| **OpenAI** | gpt-4o / o1-mini | 官方接口 | **协议适配** | 已完成接口逻辑与参数适配，未全量实机验证 |
-| **Claude** | claude-3-7-sonnet | Anthropic 协议 | **协议适配** | 已适配鉴权头与数据格式，未全量实机验证 |
-| **通义千问 / 腾讯混元 / 百度文心** | qwen-plus / hunyuan / ernie | 兼容接口 | **未实机测试** | 仅根据官方开放平台规范配置默认端点与模型 |
+| **小米 MiMO** | mimo-v2.5-pro / mimo-v2.5 | 官方兼容接口 | **已充分测试** | 支持外层 thinking 深度思考控制 |
+| **DeepSeek** | deepseek-v4-pro / deepseek-v4-flash | 官方兼容接口 | **已适配** | 端点无 /v1，支持 extra_body.thinking 与 reasoning_effort |
+| **OpenAI** | gpt-5.5 / o3 / o4-mini | 官方接口 | **协议适配** | 支持 reasoning_effort 控制，适配 max_completion_tokens |
+| **Claude** | claude-fable-5-1 / claude-opus-4-7 | Anthropic 协议 | **协议适配** | 适配 Messages API 原生报文与 Extended Thinking 预算控制 |
+| **通义千问** | qwen3.8-max / qwen3.7-plus | 兼容接口 | **协议适配** | 适配 extra_body.enable_thinking 与流式实时聚合接收 |
+| **腾讯混元** | hy3 / hunyuan-turbos / hunyuan-t1 | 兼容接口 | **协议适配** | 默认使用 hy3，已适配纯净历史消息与自适应推理 |
+| **百度千帆** | ernie-5.1 / ernie-x1-turbo | 兼容接口 | **协议适配** | 适配 v2 端点与 IAM Bearer 鉴权头 |
+| **Google Gemini** | gemini-3.8-flash / gemini-3 | 兼容接口 | **协议适配** | 适配 v1beta/openai/ 接入点 |
 | **自定义端点** | 自定义模型 | OpenAI 格式 | **支持** | 支持任意兼容 OpenAI 规范的本地模型或第三方中转端点 |
 
 ### 2. 语音合成 (TTS) 兼容性
