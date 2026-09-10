@@ -1,0 +1,72 @@
+# ==============================================================================
+# 敏感配置与密钥凭据 (API Keys & Credentials)
+# ==============================================================================
+assets/config.json
+assets/key
+*.key
+*.pem
+.env
+.env.*
+
+# ==============================================================================
+# 用户运行数据与本地动态缓存 (User Data & Runtime Caches)
+# ==============================================================================
+assets/DaisyMo_history.json
+assets/favorites.json
+assets/temp_tts.wav
+assets/tts_cache/
+assets/*.tmp
+assets/*.bak
+assets/DaisyMo.soul.tmp
+assets/DaisyMo.soul.corrupt.bak
+assets/DaisyMo.soul
+
+# ==============================================================================
+# Python 环境与构建产物 (Python & Bytecode)
+# ==============================================================================
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+build/
+dist/
+*.spec
+*.egg-info/
+
+# ==============================================================================
+# IDE 与操作系统临时文件 (IDEs & OS Metadata)
+# ==============================================================================
+.claude/
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ==============================================================================
+# 大容量解包原案、原始剧本与训练语料 (Raw Game Data & Scenarios)
+# ==============================================================================
+Original*Game Data/
+*Game Data/
+Scenario Data/
+corpus/
+dataset/
+
+# ==============================================================================
+# 开发原型与测试临时产物 (Dev Prototypes & Test Artifacts)
+# ==============================================================================
+*.tmp
+*.log
+backlog_corner_test.png
+nameplate_area.png
+test_composite.png
+title-prototype.html
+ui-prototype.html
+MEMORY.md
+direction-approved.md
+preview_thinking_*.png
+verified_*.png
+hero_icon_*.png
