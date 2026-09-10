@@ -28,9 +28,10 @@ GitHub地址：https://github.com/Rosysuki/AI-DaisyMo/
 5、欢迎大家建言献策，为这个项目贡献代码和创意！如果你有任何想法或者建议，欢迎在GitHub上提交issue或者pull request。
 
 
-# 使用说明：
-1、第一次进入，需要输入你的DeepSeek的Api-Key，若没有请前往DeepSeek开放平台进行注册并适当充值。下次进入游戏，不需要再次输入。
-注：DeepSeek开放平台网址：https://platform.deepseek.com/
+# 快速启动：
+1、确保电脑已安装 Python 3.10 或更高版本（安装时务必勾选 "Add python.exe to PATH"）。
+2、双击运行 `run.bat` 即可一键启动（脚本会自动检测环境并安装必要运行依赖）。
+3、首次进入后，可在主界面右下角点击「设置」或进入游戏后点击右下角「SYSTEM」，输入对应服务商（如小米 MiMo、DeepSeek、OpenAI 等）的 API Key。下次进入自动读取配置，无需重复输入。
 
 2、提示词位于assets/DaisyMo.soul文件，可对初始的提示词进行修改，运行游戏后则不允许修改。
 
