@@ -38,7 +38,12 @@ from cv2 import VideoCapture, cvtColor, COLOR_RGB2BGR
 from collections import deque
 from threading import Thread, Lock
 from queue import Queue
+import sys
 from sys import platform, exit as sys_exit
+
+# 独立打包运行时安全锚定工作目录至 exe 同级路径
+if getattr(sys, 'frozen', False):
+    os.chdir(os.path.dirname(sys.executable))
 from os import path as os_path, listdir, replace as os_replace
 from random import choice, randint, seed
 from base64 import b64encode, b64decode
