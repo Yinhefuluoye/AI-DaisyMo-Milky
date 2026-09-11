@@ -742,3 +742,204 @@ class TabGroup:
 
     # 规范契约别名
     draw = render
+
+
+class DialogueScrollBar:
+    """
+    自绘和风微型垂直滚动条组件 (Dialogue Vertical ScrollBar)
+    专为剧情对话框长文本设计：
+    1. 仅在 total_lines > visible_lines 时显示，短文本保持优雅静默；
+    2. 支持鼠标滚轮滚动（光标悬停在对话框区域即可直接滚屏）；
+    3. 支持鼠标左键拖拽滑块以及点击轨道上下翻页；
+    4. 支持打字机自动跟手追光（auto_pin_bottom）：打出第4、5行时视口自动贴底，用户向上滚轮查阅时暂停追光，滚回最底部后自动恢复追光；
+    5. 和风半透明轨道与琥珀橙滑块，悬停微扩，完全契合 GAL 游戏界面。
+    """
+
+    def __init__(
+        self,
+        rect: pygame.Rect,
+        visible_lines: int = 3,
+        track_color: Tuple[int, int, int, int] = (20, 20, 25, 90),
+        thumb_color: Tuple[int, int, int, int] = (225, 225, 230, 130),
+        thumb_hover_color: Tuple[int, int, int, int] = (255, 175, 50, 220),
+        thumb_drag_color: Tuple[int, int, int, int] = (255, 150, 25, 240)
+    ) -> None:
+        self.rect: pygame.Rect = pygame.Rect(rect)
+        self.visible_lines: int = visible_lines
+        self.total_lines: int = 0
+        self.scroll_index: int = 0  # 当前可视区域第一行的行号 (0-based)
+
+        self.is_dragging: bool = False
+        self.drag_start_y: int = 0
+        self.drag_start_index: int = 0
+        self.auto_pin_bottom: bool = True
+        self.is_hovered: bool = False
+
+        self.track_color = track_color
+        self.thumb_color = thumb_color
+        self.thumb_hover_color = thumb_hover_color
+        self.thumb_drag_color = thumb_drag_color
+
+    @property
+    def max_scroll(self) -> int:
+        return max(0, self.total_lines - self.visible_lines)
+
+    @property
+    def is_visible(self) -> bool:
+        return self.total_lines > self.visible_lines
+
+    def reset(self) -> None:
+        """在新的一句对话开始时重置状态"""
+        self.scroll_index = 0
+        self.auto_pin_bottom = True
+        self.is_dragging = False
+
+    def update_lines(self, total_lines: int) -> None:
+        """更新总行数，若开启了自动追光且行数增加，视口自动钉在底部"""
+        self.total_lines = total_lines
+        if self.auto_pin_bottom and self.total_lines > self.visible_lines:
+            self.scroll_index = self.max_scroll
+        else:
+            self.scroll_index = max(0, min(self.scroll_index, self.max_scroll))
+
+    def scroll_by(self, delta: int) -> bool:
+        """按行数相对滚动 (delta: +1 向下滚，-1 向上滚)"""
+        if not self.is_visible:
+            return False
+
+        new_idx = max(0, min(self.max_scroll, self.scroll_index + delta))
+        if new_idx != self.scroll_index:
+            self.scroll_index = new_idx
+            # 如果滚到了最底行，自动恢复打字追光；否则暂停追光
+            self.auto_pin_bottom = (self.scroll_index >= self.max_scroll)
+            return True
+        return False
+
+    def _get_thumb_rect(self) -> pygame.Rect:
+        """计算当前滑块在屏幕上的绝对 Rect"""
+        if not self.is_visible:
+            return pygame.Rect(self.rect.x, self.rect.y, self.rect.width, self.rect.height)
+
+        track_h = self.rect.height
+        # 滑块高度自适应，最小 18 像素
+        thumb_h = max(18, int(track_h * (self.visible_lines / self.total_lines)))
+        avail_h = track_h - thumb_h
+
+        if self.max_scroll > 0:
+            thumb_y = self.rect.y + int(avail_h * (self.scroll_index / self.max_scroll))
+        else:
+            thumb_y = self.rect.y
+
+        # 悬停或拖拽时宽度微增 2px
+        w = self.rect.width + (2 if (self.is_hovered or self.is_dragging) else 0)
+        x = self.rect.centerx - w // 2
+        return pygame.Rect(x, thumb_y, w, thumb_h)
+
+    def handle_event(
+        self,
+        event: pygame.event.Event,
+        mx: Optional[int] = None,
+        my: Optional[int] = None,
+        in_dialogue_area: bool = False
+    ) -> bool:
+        """
+        处理鼠标事件
+        :param event: pygame 事件
+        :param mx: 鼠标 X
+        :param my: 鼠标 Y
+        :param in_dialogue_area: 鼠标是否落在整个对话框区域内（落在对话框即可响应滚轮）
+        :return: 是否消耗/响应了事件
+        """
+        if mx is None or my is None:
+            mx, my = pygame.mouse.get_pos()
+
+        thumb_rect = self._get_thumb_rect()
+        hit_track = self.rect.collidepoint(mx, my) or thumb_rect.collidepoint(mx, my)
+        self.is_hovered = self.is_visible and hit_track
+
+        # 1. 现代 Pygame MOUSEWHEEL 滚轮事件
+        if event.type == pygame.MOUSEWHEEL:
+            if in_dialogue_area or hit_track:
+                if self.is_visible:
+                    if event.y > 0:
+                        self.scroll_by(-1)
+                    elif event.y < 0:
+                        self.scroll_by(1)
+                return True  # 滚轮落在对话框或滚动条上，必须无条件消费，绝不泄露穿透！
+
+        # 2. 传统 Pygame 滚轮 (button 4 向上，button 5 向下)
+        if event.type == MOUSEBUTTONDOWN:
+            if (in_dialogue_area or hit_track) and event.button in (4, 5):
+                if self.is_visible:
+                    if event.button == 4:
+                        self.scroll_by(-1)
+                    elif event.button == 5:
+                        self.scroll_by(1)
+                return True  # 无论是否已触碰滚动边界，滚轮事件必须无条件消费，绝不让点击误判！
+
+            # 鼠标左键点击滚动条区域
+            if event.button == 1 and self.is_visible and hit_track:
+                if thumb_rect.collidepoint(mx, my):
+                    self.is_dragging = True
+                    self.drag_start_y = my
+                    self.drag_start_index = self.scroll_index
+                    return True
+                else:
+                    # 点击了滑块上方或下方的轨道：快速翻页
+                    if my < thumb_rect.y:
+                        self.scroll_by(-2)
+                    elif my > thumb_rect.bottom:
+                        self.scroll_by(2)
+                    return True
+
+        elif event.type == MOUSEBUTTONUP and event.button == 1:
+            if self.is_dragging:
+                self.is_dragging = False
+                return True
+
+        elif event.type == MOUSEMOTION:
+            if self.is_dragging and self.is_visible:
+                track_h = self.rect.height
+                thumb_h = max(18, int(track_h * (self.visible_lines / self.total_lines)))
+                avail_h = track_h - thumb_h
+                if avail_h > 0 and self.max_scroll > 0:
+                    delta_y = my - self.drag_start_y
+                    delta_idx = int(round((delta_y / avail_h) * self.max_scroll))
+                    new_idx = max(0, min(self.max_scroll, self.drag_start_index + delta_idx))
+                    if new_idx != self.scroll_index:
+                        self.scroll_index = new_idx
+                        self.auto_pin_bottom = (self.scroll_index >= self.max_scroll)
+                        return True
+
+        return False
+
+    def render(self, surface: pygame.Surface) -> None:
+        """自绘半透明和风轨道与圆角滑块"""
+        if not self.is_visible:
+            return
+
+        # 1. 绘制半透明轨道
+        track_surf = pygame.Surface((self.rect.width, self.rect.height), pygame.SRCALPHA)
+        track_surf.fill(self.track_color)
+        surface.blit(track_surf, (self.rect.x, self.rect.y))
+
+        # 2. 绘制滑块
+        thumb_rect = self._get_thumb_rect()
+        if self.is_dragging:
+            cur_color = self.thumb_drag_color
+        elif self.is_hovered:
+            cur_color = self.thumb_hover_color
+        else:
+            cur_color = self.thumb_color
+
+        thumb_surf = pygame.Surface((thumb_rect.width, thumb_rect.height), pygame.SRCALPHA)
+        pygame.draw.rect(
+            thumb_surf,
+            cur_color,
+            pygame.Rect(0, 0, thumb_rect.width, thumb_rect.height),
+            border_radius=3
+        )
+        surface.blit(thumb_surf, (thumb_rect.x, thumb_rect.y))
+
+    # 规范别名
+    draw = render

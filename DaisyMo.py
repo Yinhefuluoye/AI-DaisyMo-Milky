@@ -102,7 +102,8 @@ from daisymo_widgets import (
     TextInputBox,
     SliderBar,
     DropdownMenu,
-    TabGroup
+    TabGroup,
+    DialogueScrollBar
 )
 from daisymo_memory import get_scenario_context
 
@@ -949,6 +950,7 @@ class Screen(object):
         dock_en_font = pygame.font.Font(font_cn_med, 9)
         meta_en_font = pygame.font.Font(font_cn_med, 11)
         meta_sub_font = pygame.font.Font(font_cn_med, 9)
+        meta_version_font = pygame.font.Font(font_cn_med, 12)
         dialog_title_font = pygame.font.Font(font_cn_med, 17)
         dialog_sub_font = pygame.font.Font(font_cn_med, 13)
         dialog_sub2_font = pygame.font.Font(font_cn_med, 12)
@@ -1005,6 +1007,16 @@ class Screen(object):
         ]
         p_layer = pygame.Surface((1280, 720), pygame.SRCALPHA)
 
+        # 左下角版本印记微透和风胶囊底衬 (2x SSAA 抗锯齿，316x42，确保高亮杂色背景下清晰锐利)
+        capsule_w, capsule_h = 316, 42
+        capsule_x, capsule_y = 26, 660
+        capsule_2x = pygame.Surface((capsule_w * 2, capsule_h * 2), pygame.SRCALPHA)
+        pygame.draw.rect(capsule_2x, (15, 18, 25, 140), (0, 0, capsule_w * 2, capsule_h * 2), border_radius=14)
+        pygame.draw.rect(capsule_2x, (255, 255, 255, 36), (0, 0, capsule_w * 2, capsule_h * 2), width=2, border_radius=14)
+        capsule_surf = pygame.transform.smoothscale(capsule_2x, (capsule_w, capsule_h))
+        meta_version_surf = meta_version_font.render("AI-DAISYMO V0.1", True, (255, 255, 255))
+        meta_sub_surf = meta_sub_font.render("TRICOLOUR LOVESTORY FANMADE COMPANION SYSTEM", True, (215, 220, 230))
+
         # 提取渲染完整主标题静帧的基础函数（用于平滑消融目标图与主事件循环）
         def _render_title_base(target_surface: pygame.Surface, hover_h = 0.0, hover_d: int = -1, anim_time: float = 0.0) -> None:
             hover_val = float(hover_h)
@@ -1017,11 +1029,10 @@ class Screen(object):
             target_surface.blit(top_meta_shadow, (1280 - 32 - top_meta.get_width() + 1, 24 + 1))
             target_surface.blit(top_meta, (1280 - 32 - top_meta.get_width(), 24))
 
-            # 左下角版本印记
-            vm_surf = meta_en_font.render("AI-DAISYMO V0.1", True, (255, 255, 255))
-            vsub_surf = meta_sub_font.render("TRICOLOUR LOVESTORY FANMADE COMPANION SYSTEM", True, (200, 205, 215))
-            target_surface.blit(vm_surf, (32, 665))
-            target_surface.blit(vsub_surf, (32, 683))
+            # 左下角版本印记（微透和风胶囊底衬 + 锐利清晰排印）
+            target_surface.blit(capsule_surf, (capsule_x, capsule_y))
+            target_surface.blit(meta_version_surf, (capsule_x + 10, capsule_y + 5))
+            target_surface.blit(meta_sub_surf, (capsule_x + 10, capsule_y + 24))
 
             # Hero 便签主按钮（白色便签质感 · 224x68 黄金尺寸 · 2x SSAA 超采样去毛刺 · Letter-spacing 高级排版）
             cur_hero_y = hero_y - (hover_val * 3.0)
@@ -1335,6 +1346,8 @@ class Screen(object):
         self.current_text_index = 0
         self.last_type_time = time()
         self.typewriter_done = False
+        if hasattr(self, 'dialogue_scrollbar') and self.dialogue_scrollbar:
+            self.dialogue_scrollbar.reset()
 
     def step_typewriter(self) -> None:
         """更新打字机字数"""
@@ -1424,6 +1437,9 @@ class Screen(object):
         rect_dialogue_box = pygame.Rect(232, 600, 840, 70)
         rect_send_btn    = pygame.Rect(1005, 602, 65, 28)
 
+        # 自绘和风微型垂直滚动条（位于对话框右边缘内侧：x=1064, y=604, w=6, h=74）
+        self.dialogue_scrollbar = DialogueScrollBar(pygame.Rect(1064, 604, 6, 74), visible_lines=3)
+
         fade_in_alpha: int = 255
         _fade_surf: pygame.SurfaceType = pygame.Surface((1280, 720))
         _fade_surf.fill((0, 0, 0))
@@ -1486,8 +1502,33 @@ class Screen(object):
                         self.ui_hidden = False
                     continue
 
+                in_dialogue = rect_dialogue_box.collidepoint(mouse_x, mouse_y) or self.dialogue_scrollbar.rect.collidepoint(mouse_x, mouse_y)
+
+                # 滚轮事件（现代 Pygame MOUSEWHEEL，光标在对话区即可触发，绝不向下穿透为点击）
+                if event.type == pygame.MOUSEWHEEL:
+                    if self.mode == DAISYMO and in_dialogue:
+                        self.dialogue_scrollbar.handle_event(event, mouse_x, mouse_y, in_dialogue_area=True)
+                    continue
+
                 if event.type == MOUSEBUTTONDOWN:
                     mx, my = event.pos
+
+                    # 传统滚轮事件分流（Button 4 向上，Button 5 向下，无条件阻断，绝不穿透为点击）
+                    if event.button in (4, 5):
+                        if self.mode == DAISYMO and in_dialogue:
+                            self.dialogue_scrollbar.handle_event(event, mx, my, in_dialogue_area=True)
+                        continue
+
+                    # 滚动条滑块拖拽与轨道点击（仅左键点击滚动条区域时拦截）
+                    if self.mode == DAISYMO and self.dialogue_scrollbar.is_visible:
+                        thumb_rect = self.dialogue_scrollbar._get_thumb_rect()
+                        if self.dialogue_scrollbar.rect.collidepoint(mx, my) or thumb_rect.collidepoint(mx, my):
+                            self.dialogue_scrollbar.handle_event(event, mx, my, in_dialogue_area=in_dialogue)
+                            continue
+
+                    # 仅响应鼠标左键点击 (Button 1)，右键与中键绝不触发按钮与跳转
+                    if event.button != 1:
+                        continue
 
                     # 1. 底部功能栏点击
                     if rect_auto.collidepoint(mx, my):
@@ -1551,14 +1592,19 @@ class Screen(object):
                                     self.player_input = self.player_box.text
 
                 elif event.type == MOUSEMOTION:
-                    if self.mode == PLAYER:
+                    if self.mode == DAISYMO:
+                        self.dialogue_scrollbar.handle_event(event, event.pos[0], event.pos[1], in_dialogue_area=in_dialogue)
+                    elif self.mode == PLAYER:
                         if self.player_box.handle_event(event, event.pos[0], event.pos[1], self._get_clipboard_text, self._set_clipboard_text):
                             self.player_input = self.player_box.text
 
                 elif event.type == MOUSEBUTTONUP:
-                    if event.button == 1 and self.mode == PLAYER:
-                        if self.player_box.handle_event(event, event.pos[0], event.pos[1], self._get_clipboard_text, self._set_clipboard_text):
-                            self.player_input = self.player_box.text
+                    if event.button == 1:
+                        if self.mode == DAISYMO:
+                            self.dialogue_scrollbar.handle_event(event, event.pos[0], event.pos[1], in_dialogue_area=in_dialogue)
+                        elif self.mode == PLAYER:
+                            if self.player_box.handle_event(event, event.pos[0], event.pos[1], self._get_clipboard_text, self._set_clipboard_text):
+                                self.player_input = self.player_box.text
 
                 elif event.type == KEYDOWN:
                     if event.key == K_ESCAPE:
@@ -1695,19 +1741,30 @@ class Screen(object):
 
             # 4. 对话内容区 (复用同一区域)
             if self.mode == DAISYMO:
-                # 状态 A: 墨小菊对白 (逐字打字机 + 跳动倒三角)
-                lines = self.wrap_text(Screen.font, self.display_text, 830)
+                # 状态 A: 墨小菊对白 (逐字打字机 + 滚动条视口切片 + 跳动倒三角)
+                lines = self.wrap_text(Screen.font, self.display_text, 818)
+                self.dialogue_scrollbar.update_lines(len(lines))
+
                 start_y = 604
-                for i, line in enumerate(lines[:3]):
+                scroll_start = self.dialogue_scrollbar.scroll_index
+                visible_slice = lines[scroll_start : scroll_start + 3]
+
+                for i, line in enumerate(visible_slice):
                     self.draw_text_shadow(self.screen, Screen.font, line, (232, start_y + i * 32), QCOLOR)
 
-                # 打字完成后跳动光标
+                # 绘制自绘和风微型垂直滚动条（超出 3 行时自动渲染）
+                self.dialogue_scrollbar.render(self.screen)
+
+                # 打字完成后跳动光标：仅在当前视口包含最后一行时显示在行尾
                 if self.typewriter_done and not self.is_thinking and lines:
-                    last_line = lines[-1]
-                    lw, _ = Screen.font.size(last_line)
-                    tx = 232 + lw + 6
-                    ty = start_y + (len(lines) - 1) * 32 + int(math.sin(time() * 7.5) * 3)
-                    self.screen.blit(self.main_triangle, (tx, ty))
+                    last_line_idx = len(lines) - 1
+                    if scroll_start <= last_line_idx < scroll_start + 3:
+                        disp_line_idx = last_line_idx - scroll_start
+                        last_line = visible_slice[disp_line_idx]
+                        lw, _ = Screen.font.size(last_line)
+                        tx = 232 + lw + 6
+                        ty = start_y + disp_line_idx * 32 + int(math.sin(time() * 7.5) * 3)
+                        self.screen.blit(self.main_triangle, (tx, ty))
 
             else:
                 # 状态 B: 邱诚输入 (复用自治 TextInputBox 控件)
