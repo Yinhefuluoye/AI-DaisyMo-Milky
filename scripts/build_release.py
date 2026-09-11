@@ -94,6 +94,7 @@ def copy_assets_clean():
         "config.json",          # 严防个人私密 API Key
         "DaisyMo_history.json", # 严防个人聊天历史
         "favorites.json",       # 严防个人收藏
+        "fetched_models.json",  # 用户本机的模型列表缓存
         "temp_tts.wav",         # 临时音频
         "DaisyMo.soul.tmp",
         "DaisyMo.soul.corrupt.bak",

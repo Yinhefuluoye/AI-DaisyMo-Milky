@@ -17,6 +17,7 @@ Apikey.txt
 # ==============================================================================
 assets/DaisyMo_history.json
 assets/favorites.json
+assets/fetched_models.json
 assets/history_backups/
 assets/temp_tts.wav
 assets/tts_cache/

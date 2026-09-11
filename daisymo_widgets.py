@@ -430,6 +430,9 @@ class TextInputBox:
                     cur += ch
             if cur:
                 all_lines.append(cur)
+            if not all_lines:
+                # 空文本也要保证有一行，否则光标行的推导会落在 -1，光标画不出来
+                all_lines = ['']
             offsets, off = [], 0
             for ln in all_lines:
                 offsets.append(off)

@@ -158,6 +158,9 @@ class DaisyMo(object):
     total_usage: int              = 0
     save_lock: Lock               = Lock()
 
+    # 模型列表缓存：启动时静默拉取的真实模型列表，重启后下拉不再回到硬编码预设
+    models_cache_path: str        = "assets/fetched_models.json"
+
     def __init__(
         daisymo,
         conversation: Conversation,
@@ -357,6 +360,54 @@ class DaisyMo(object):
             '{"where": "小菊卧室白天","face": "温柔-说","body": "便服单叉腰","text": "说话内容","bgm": "","sfx": ""}'
         )
         return cls._soul_cache
+
+    @classmethod
+    def load_models_cache(cls) -> None:
+        """启动时用上次拉到的模型列表覆盖硬编码预设，网络失败时下拉也不至于回退"""
+        if not os_path.exists(cls.models_cache_path):
+            return
+        try:
+            with open(cls.models_cache_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                for prov, models in data.items():
+                    if prov in AI_PROVIDERS and isinstance(models, list) and models:
+                        AI_PROVIDERS[prov]["models"] = [str(m) for m in models]
+        except Exception:
+            pass
+
+    @classmethod
+    def silent_refresh_models(cls) -> None:
+        """后台静默拉取当前服务商的真实模型列表：成功则更新预设并写缓存，失败保持现状"""
+        if not cls.api_key:
+            return
+
+        def _worker():
+            ok, models, _msg = ai_fetch_models(cls.base_url, cls.api_key, provider=cls.provider)
+            if not (ok and models):
+                return
+            prov = (cls.provider or "").strip().lower()
+            if not prov:
+                return
+            if prov in AI_PROVIDERS:
+                AI_PROVIDERS[prov]["models"] = list(models)
+            cache = {}
+            try:
+                if os_path.exists(cls.models_cache_path):
+                    with open(cls.models_cache_path, "r", encoding="utf-8") as f:
+                        loaded = json.load(f)
+                    if isinstance(loaded, dict):
+                        cache = loaded
+            except Exception:
+                cache = {}
+            cache[prov] = list(models)
+            try:
+                with open(cls.models_cache_path, "w", encoding="utf-8") as f:
+                    json.dump(cache, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+
+        Thread(target=_worker, daemon=True).start()
 
     def init(daisymo) -> Dict[str, str]:
         # 保护并还原 assets/DaisyMo.soul 设定文件
@@ -769,6 +820,10 @@ class Screen(object):
         self.mixer: Mixer = Mixer()
         self.mixer.air()
 
+        # 模型列表：先吃上次拉取的缓存，再后台静默刷新（已填 Key 才拉，失败即预设兜底）
+        DaisyMo.load_models_cache()
+        DaisyMo.silent_refresh_models()
+
     def show_toast(self, text: str) -> None:
         """显示纯文本轻量浮动提示（无 Emoji）"""
         self.ui.toast_text = remove_emojis(text).strip()
@@ -813,7 +868,7 @@ class Screen(object):
         if not clean_text:
             return
 
-        is_same_text = (getattr(self, "current_playing_text", "") == clean_text)
+        is_same_text = (self.ui.current_playing_text == clean_text)
 
         # 每次发起新语音或打断时，独占递增全局请求版本号
         self.ui.tts_req_id += 1
@@ -1512,6 +1567,7 @@ class Screen(object):
             clock.tick(Screen.FPS)
             blink.tick()
             mouse_x, mouse_y = pygame.mouse.get_pos()
+            mx, my = mouse_x, mouse_y  # 键盘事件分支也会用到 mx/my，先给帧级初值，纯键盘操作不崩
 
             # 检查异步回复与思考超时（1分钟超时保护）
             if self.ui.is_thinking:
@@ -1520,10 +1576,10 @@ class Screen(object):
                     if isinstance(q_item, tuple):
                         req_id, res = q_item
                     else:
-                        req_id, res = getattr(self, "current_req_id", 0), q_item
+                        req_id, res = self.ui.current_req_id, q_item
 
                     # 仅接收当前请求的最新响应，抛弃超时的旧响应
-                    if req_id == getattr(self, "current_req_id", 0):
+                    if req_id == self.ui.current_req_id:
                         self.ui.is_thinking = False
                         if not res:
                             self.start_typewriter("……唔，网络或者API配置好像有点问题，没连上。你去检查一下设置吧！")
@@ -1535,10 +1591,10 @@ class Screen(object):
                                 self.start_typewriter(DaisyMo.text)
                                 self.daisymo.auto_save()
 
-                elif time() - getattr(self, "thinking_start_time", time()) > 60.0:
+                elif time() - self.ui.thinking_start_time > 60.0:
                     # 1 分钟超时未响应保护
                     self.ui.is_thinking = False
-                    self.ui.current_req_id = getattr(self, "current_req_id", 0) + 1
+                    self.ui.current_req_id = self.ui.current_req_id + 1
                     while not self.chat_queue.empty():
                         try:
                             self.chat_queue.get_nowait()
@@ -1733,7 +1789,7 @@ class Screen(object):
 
             # UI 隐藏模式（提示仅在进入前 0.5 秒内显示，超时自动隐去以呈现纯净全屏画面）
             if self.ui.ui_hidden:
-                if time() - getattr(self, "ui_hidden_time", 0.0) < 0.5:
+                if time() - self.ui.ui_hidden_time < 0.5:
                     hint_surf = Screen.dfont.render("〈 点击屏幕任意处恢复界面 〉", True, GOLD_COLOR)
                     hx = (1280 - hint_surf.get_width()) // 2
                     pygame.draw.rect(self.screen, (16, 20, 28), (hx - 16, 20, hint_surf.get_width() + 32, 28), border_radius=14)
@@ -1836,9 +1892,9 @@ class Screen(object):
                 # 状态 B: 邱诚输入 (复用自治 TextInputBox 控件)
                 if not self.player_box.text:
                     holder = Screen.dfont.render("想对小菊说些什么…… (按 Enter 发送，Tab 切换回对白)", True, MUTED_COLOR)
-                    self.screen.blit(holder, (232, 604 + 4))
-                else:
-                    self.player_box.render(self.screen, blink.visible)
+                    self.screen.blit(holder, (248, 604 + 4))
+                # 无论有无文字都渲染输入框：空框时光标就是唯一的活性反馈
+                self.player_box.render(self.screen, blink.visible)
 
                 # 发送按钮（纯文字居中，杜绝特殊符号方块乱码）
                 send_bg = (255, 158, 27) if rect_send_btn.collidepoint(mouse_x, mouse_y) else (200, 110, 15)
@@ -1946,7 +2002,7 @@ class Screen(object):
         self.set_mode(DAISYMO)
         self.ui.is_thinking = True
         self.ui.thinking_start_time = time()
-        self.ui.current_req_id = getattr(self, "current_req_id", 0) + 1
+        self.ui.current_req_id = self.ui.current_req_id + 1
         req_id = self.ui.current_req_id
         self.ui.display_text = "『 墨小菊正在思考... 』"
 
@@ -2319,7 +2375,7 @@ class Screen(object):
                     text = row["text"]
                     rect_v = pygame.Rect(paper_rect.width - 70, row["y"] + 2, 22, 21)
                     rect_f = pygame.Rect(paper_rect.width - 36, row["y"] + 1, 24, 23)
-                    if self.ui.is_voice_playing and getattr(self, "current_playing_text", "") == text:
+                    if self.ui.is_voice_playing and self.ui.current_playing_text == text:
                         v_icon = btn_voice_normal.copy()
                         v_icon.fill((255, 155, 0, 255), special_flags=pygame.BLEND_RGBA_MULT)
                     else:
@@ -2382,7 +2438,7 @@ class Screen(object):
                     f_text = row["text"]
                     rect_v = pygame.Rect(paper_rect.width - 70, row["y"] + 2, 22, 21)
                     rect_f = pygame.Rect(paper_rect.width - 36, row["y"] + 1, 24, 23)
-                    if self.ui.is_voice_playing and getattr(self, "current_playing_text", "") == f_text:
+                    if self.ui.is_voice_playing and self.ui.current_playing_text == f_text:
                         v_icon = btn_voice_normal.copy()
                         v_icon.fill((255, 155, 0, 255), special_flags=pygame.BLEND_RGBA_MULT)
                     else:
