@@ -38,7 +38,7 @@
 
 ### 方式一：下载 Release 运行包（推荐）
 
-前往项目的 [Releases 页面](https://github.com/Yinhefuluoye/AI-DaisyMo-Milky/releases) 下载最新发布的绿色整合包，解压后直接运行可执行程序。
+前往项目的 [Releases 页面](https://github.com/Yinhefuluoye/AI-DaisyMo-Milky/releases) 下载最新发布的包，解压后直接运行可执行程序。
 
 ### 方式二：从源码运行（可选）
 
