@@ -30,7 +30,7 @@
 - **语料蒸馏心智设定**：基于 6,397 句官方剧本原案对话提炼角色提示词，规范语气节律与动作表情映射。
 - **深度思考能力适配**：自动识别模型是否具备推理能力（如 deepseek-v4-pro、hy3、mimo-v2.5-pro 等），支持开启、关闭与置灰禁用三态；关闭时显式降低延迟，实现 2 秒级响应。
 - **TTS 语音合成支持**：内置双协议适配器，兼容标准 OpenAI 协议与小米 MiMO 语音端点。
-- **多模型服务商接入**：提供小米 MiMO、DeepSeek、Claude、OpenAI、Gemini、通义千问、腾讯混元、百度千帆等服务商预设及自定义端点配置。
+- **多模型服务商接入**：提供小米 MiMO、DeepSeek、Claude、OpenAI、Gemini、通义千问、腾讯混元、文心一言等服务商预设及自定义端点配置。
 
 ---
 
@@ -56,49 +56,6 @@
 ## 首次配置
 
 首次进入游戏后，在主界面点击「设置」（或在对话中点击右下角「SYSTEM」），选择服务商并填写对应的 API Key，点击「保存配置」即可生效。配置保存在本地，下次启动自动读取。
-
----
-
-## 常用操作与快捷键
-
-| 按键 / 操作 | 功能 |
-| :--- | :--- |
-| `1` | 切换立绘表情 |
-| `2` | 切换服装动作 |
-| `3` | 切换场景背景 |
-| `SPACE` / 鼠标左键 | 推进对话 / 快速显示文本 |
-| `ESC` | 退出全屏 / 关闭弹窗 |
-| 界面按钮 | **AUTO** 自动播放 / **LOG** 回忆记录 / **SYS** 系统设置 |
-
----
-
-## 当前版本状态 (v0.1)
-
-目前底层代码已按标准协议接入多家模型与语音服务，实际测试覆盖情况如下：
-
-### 1. 大模型 (LLM) 兼容性
-
-| 服务商 | 模型示例 | 接入方式 | 实测状态 | 说明 |
-| :--- | :--- | :--- | :--- | :--- |
-| **小米 MiMO** | mimo-v2.5-pro / mimo-v2.5 | 官方兼容接口 | **已充分测试** | 支持外层 thinking 深度思考控制 |
-| **DeepSeek** | deepseek-v4-pro / deepseek-v4-flash | 官方兼容接口 | **已适配** | 端点无 /v1，支持 extra_body.thinking 与 reasoning_effort |
-| **OpenAI** | gpt-5.5 / o3 / o4-mini | 官方接口 | **协议适配** | 支持 reasoning_effort 控制，适配 max_completion_tokens |
-| **Claude** | claude-fable-5-1 / claude-opus-4-7 | Anthropic 协议 | **协议适配** | 适配 Messages API 原生报文与 Extended Thinking 预算控制 |
-| **通义千问** | qwen3.8-max / qwen3.7-plus | 兼容接口 | **协议适配** | 适配 extra_body.enable_thinking 与流式实时聚合接收 |
-| **腾讯混元** | hy3 / hunyuan-turbos / hunyuan-t1 | 兼容接口 | **协议适配** | 默认使用 hy3，已适配纯净历史消息与自适应推理 |
-| **百度千帆** | ernie-5.1 / ernie-x1-turbo | 兼容接口 | **协议适配** | 适配 v2 端点与 IAM Bearer 鉴权头 |
-| **Google Gemini** | gemini-3.8-flash / gemini-3 | 兼容接口 | **协议适配** | 适配 v1beta/openai/ 接入点 |
-| **自定义端点** | 自定义模型 | OpenAI 格式 | **支持** | 支持任意兼容 OpenAI 规范的本地模型或第三方中转端点 |
-
-### 2. 语音合成 (TTS) 兼容性
-
-| 服务 / 协议 | 适配说明 | 实测状态 |
-| :--- | :--- | :--- |
-| **小米 MiMo TTS** | 采用 chat/completions 音频扩展协议 | **已充分测试**（茉莉等音色实测正常） |
-| **OpenAI 规范 TTS** | 标准 /v1/audio/speech 端点 | **协议适配**（已写好调用逻辑，未接入付费 Key 详测） |
-| **本地服务 (如 GPT-SoVITS 等)** | 本地无需鉴权的 OpenAI 兼容接口 | **协议适配**（预留端点与音色字段，待社区反馈） |
-
-> 注：如在未实测的服务商或自建端点上遇到接口报错，欢迎提交 [Issue](https://github.com/Yinhefuluoye/AI-DaisyMo-Milky/issues) 协助完善。
 
 ---
 
