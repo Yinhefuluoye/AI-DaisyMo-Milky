@@ -1,7 +1,7 @@
 <div align="center">
   <img src="./icon.png" alt="AI-DaisyMo Logo" width="128"/>
   <h1>AI 墨小菊 (AI-DaisyMo)</h1>
-  <p>《三色绘恋》墨小菊 同人交互程序</p>
+  <p>《三色绘恋》墨小菊 同人Ai聊天程序</p>
   <p>
     <img src="https://img.shields.io/badge/Python-3.10+-3776AB?style=flat&logo=python&logoColor=white" alt="Python 3.10+"/>
     <img src="https://img.shields.io/badge/Pygame-2.5+-4B8BBE?style=flat" alt="Pygame"/>
