@@ -72,6 +72,9 @@ nameplate_area.png
 test_composite.png
 title-prototype.html
 ui-prototype.html
+
+# 开发残留归档目录（一次性脚本、笔记、密钥草稿、旧原型，不入库）
+dev_scratch/
 MEMORY.md
 direction-approved.md
 *报告*.md
