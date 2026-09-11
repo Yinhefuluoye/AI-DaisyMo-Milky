@@ -89,7 +89,7 @@ def copy_assets_clean():
     dst_assets.mkdir(parents=True, exist_ok=True)
 
     # 排除名单
-    EXCLUDE_DIRS = {"tts_cache"}
+    EXCLUDE_DIRS = {"tts_cache", "history_backups"}
     EXCLUDE_FILES = {
         "config.json",          # 严防个人私密 API Key
         "DaisyMo_history.json", # 严防个人聊天历史
@@ -159,6 +159,9 @@ def verify_build():
     assert soul_path.exists(), "角色提示词缺失: DaisyMo.soul"
     assert ui_path.exists(), "UI 目录缺失: assets/ui"
     assert not (RELEASE_DIR / "assets" / "config.json").exists(), "严重安全错误: config.json 被意外包含！"
+    assert not (RELEASE_DIR / "assets" / "favorites.json").exists(), "严重安全错误: favorites.json 被意外包含！"
+    assert not (RELEASE_DIR / "assets" / "DaisyMo_history.json").exists(), "严重安全错误: DaisyMo_history.json 被意外包含！"
+    assert not (RELEASE_DIR / "assets" / "history_backups").exists(), "严重安全错误: history_backups 目录被意外包含！"
     assert ZIP_PATH.exists(), "最终压缩包未生成！"
     
     exe_size_mb = exe_path.stat().st_size / (1024 * 1024)

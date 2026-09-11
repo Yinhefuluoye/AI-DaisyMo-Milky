@@ -62,7 +62,7 @@ from os import path as os_path, listdir, replace as os_replace
 from random import choice, randint, seed
 from base64 import b64encode, b64decode
 from time import time, localtime, strftime
-from typing import NoReturn, Self, Tuple, Deque, Dict, List, Callable, Optional
+from typing import NoReturn, Self, Tuple, Deque, Dict, List, Callable, Optional, Any
 
 
 if platform == "win32":
@@ -103,9 +103,15 @@ from daisymo_widgets import (
     SliderBar,
     DropdownMenu,
     TabGroup,
-    DialogueScrollBar
+    DialogueScrollBar,
+    ConfirmDialog,
+    InputDialog
 )
-from daisymo_memory import get_scenario_context
+import daisymo_history_manager as history_mgr
+from daisymo_conversation import Conversation
+from daisymo_reply import parse_scene, reply_text
+from daisymo_ui_state import UiState
+from daisymo_memory import build_scenario_retriever
 
 class DaisyMo(object):
 
@@ -129,13 +135,17 @@ class DaisyMo(object):
     favorites_path: str           = "assets/favorites.json"
     favorites: List[Dict[str, str]] = []
 
-    memory: List[Dict[str, str]]  = []
+    # 聊天记录已交给 daisymo_conversation.Conversation 拥有，不再挂在类上。
+    # 实例创建时注入：DaisyMo(conversation)
     offset: List[int]             = [0, 0]
     ratio: float                  = 0.72
     default_size: Tuple[int, int] = None
 
     last_face_path: str           = ''
     last_body_path: str           = ''
+    # 背景缓存：只有 next() 与 random_back() 会写。以前挂 Screen 上（模型反向写 UI 的状态），现在归 DaisyMo 自己。
+    default_back: pygame.SurfaceType = None
+    last_back_path: str           = ''
     photos: Deque[Tuple[pygame.SurfaceType, pygame.SurfaceType]] = deque([])
     text: str                     = ''
     default_save_path: str        = ''
@@ -148,7 +158,15 @@ class DaisyMo(object):
     total_usage: int              = 0
     save_lock: Lock               = Lock()
 
-    def __init__(daisymo, on_first_meet: Optional[Callable[[], None]] = None) -> NoReturn:
+    def __init__(
+        daisymo,
+        conversation: Conversation,
+        on_first_meet: Optional[Callable[[], None]] = None,
+        scenario_retriever=None
+    ) -> NoReturn:
+        # 依赖注入：聊天记录与剧情检索器的所有者都由调用方创建后传进来，这里不自己造
+        daisymo.conversation: Conversation = conversation
+        daisymo.scenario_retriever = scenario_retriever or build_scenario_retriever()
         daisymo.load_config()
         if DaisyMo.first_meet and on_first_meet:
             on_first_meet()
@@ -308,25 +326,37 @@ class DaisyMo(object):
         """检测当前大模型是否具备并支持深度思考 (Reasoning / Thinking) 能力 (委托至 daisymo_ai 核心引擎)"""
         return ai_check_thinking_support(provider, base_url, model, api_key)
 
+    # 人格设定缓存：加载一次持有，后续请求不再碰磁盘
+    _soul_cache: Optional[str] = None
+
+    @classmethod
+    def invalidate_soul_cache(cls) -> None:
+        """清空人格设定缓存（测试或运行时热重载人格文件时用）"""
+        cls._soul_cache = None
+
     @classmethod
     def get_soul(cls) -> str:
-        """获取墨小菊核心人格设定与JSON输出约束（优先读取根目录原案定义）"""
+        """获取墨小菊核心人格设定与JSON输出约束（优先读取根目录原案定义，加载一次后缓存）"""
+        if cls._soul_cache is not None:
+            return cls._soul_cache
         for path in ("DaisyMo.soul", "assets/DaisyMo_prompt.soul", "assets/DaisyMo.soul"):
             if os_path.exists(path):
                 try:
                     with open(path, 'r', encoding="utf-8") as f:
                         c = f.read().strip()
                         if c and not c.startswith('['):
+                            cls._soul_cache = c
                             return c
                 except Exception:
                     pass
-        return (
+        cls._soul_cache = (
             "你是墨小菊（Daisy Mo），17岁高二女生，留着标志性的琥珀色双马尾，琥珀色眼瞳。\n"
             "你是邱诚7岁相识至今的邻居与青梅竹马。自幼以“姐姐”自居保护怯懦的邱诚，对他有强烈的保护欲与依赖感。\n"
             "平日语速利落轻快、元气傲娇，叫邱诚“笨蛋”，自称“姐姐”。\n"
             "必须严格以合法JSON格式输出，禁止任何多余文字或Markdown标记，格式如下：\n"
             '{"where": "小菊卧室白天","face": "温柔-说","body": "便服单叉腰","text": "说话内容","bgm": "","sfx": ""}'
         )
+        return cls._soul_cache
 
     def init(daisymo) -> Dict[str, str]:
         # 保护并还原 assets/DaisyMo.soul 设定文件
@@ -355,32 +385,11 @@ class DaisyMo(object):
                 with open(hist_path, 'r', encoding="utf-8") as f:
                     saved_mem = json.load(f)
                 if isinstance(saved_mem, list) and saved_mem:
-                    DaisyMo.memory = [m for m in saved_mem if isinstance(m, dict) and m.get("role") in ("user", "assistant")]
-                    for m in reversed(DaisyMo.memory):
+                    daisymo.conversation.replace_with(saved_mem)
+                    for m in reversed(daisymo.conversation.messages()):
                         if m.get("role") == "assistant":
-                            cnt = m.get("content", "")
-                            p = {}
-                            try:
-                                p = json.loads(cnt)
-                            except Exception:
-                                s = cnt.find('{')
-                                e = cnt.rfind('}') + 1
-                                if s != -1 and e > s:
-                                    try:
-                                        p = json.loads(cnt[s:e])
-                                    except Exception:
-                                        pass
-                            if not p and cnt.strip():
-                                p = {
-                                    "where": "小菊卧室白天",
-                                    "face": "温柔-说",
-                                    "body": "便服单叉腰",
-                                    "text": remove_emojis(cnt).strip(),
-                                    "bgm": "",
-                                    "sfx": ""
-                                }
+                            p = parse_scene(m.get("content", ""), clean_text=remove_emojis)
                             if p and p.get("text"):
-                                p["text"] = remove_emojis(p["text"])
                                 return daisymo.next(p)
             except Exception as e:
                 debug("读取历史记录失败", str(e))
@@ -421,14 +430,15 @@ class DaisyMo(object):
         return daisymo
 
     def chat(daisymo, text: str) -> str:
-        DaisyMo.memory.append({"role": "user", "content": text})
+        conversation: Conversation = daisymo.conversation
+        conversation.append("user", text)
 
         # 动态检索三色绘恋客观剧情事实（结合近几轮上下文避免代词指代，未命中则返回空，0 Token 增量）
         query_text = text
-        if len(DaisyMo.memory) >= 3:
-            prev_user_msgs = [m["content"] for m in DaisyMo.memory[-3:] if m.get("role") == "user"]
+        if len(conversation) >= 3:
+            prev_user_msgs = [m["content"] for m in conversation.messages()[-3:] if m.get("role") == "user"]
             query_text = " ".join(prev_user_msgs)
-        scenario_context = get_scenario_context(query_text)
+        scenario_context = daisymo.scenario_retriever.query_relevant_facts(query_text)
 
         cfg = AIConfig(
             provider=DaisyMo.provider,
@@ -438,7 +448,7 @@ class DaisyMo(object):
             enable_thinking=DaisyMo.enable_thinking
         )
         res = ai_chat_completion(
-            messages=DaisyMo.memory,
+            messages=conversation.messages(),
             system_prompt=daisymo.get_soul(),
             config=cfg,
             scenario_context=scenario_context
@@ -448,7 +458,7 @@ class DaisyMo(object):
             DaisyMo.last_usage = res.usage
             DaisyMo.total_usage += res.total_tokens
             if respond:
-                DaisyMo.memory.append({"role": "assistant", "content": respond})
+                conversation.append("assistant", respond)
             if __DEBUG__:
                 print('= ' * 10)
                 print(respond)
@@ -456,8 +466,10 @@ class DaisyMo(object):
             return respond
         else:
             debug("回复失败", res.error_message)
-            if DaisyMo.memory and DaisyMo.memory[-1].get("role") == "user":
-                DaisyMo.memory.pop()
+            # 失败回滚：把刚才追加的那条 user 记录撤掉，不留痕
+            msgs = conversation.messages()
+            if msgs and msgs[-1].get("role") == "user":
+                conversation.replace_with(msgs[:-1])
             return ''
 
     def chat_then_parse(daisymo, text: str) -> Dict[str, str]:
@@ -471,39 +483,11 @@ class DaisyMo(object):
         if not raw:
             return {}
 
-        # 尝试 JSON 解析
-        try:
-            respond_json = json.loads(raw)
-        except Exception:
-            start = raw.find('{')
-            end = raw.rfind('}') + 1
-            if start != -1 and end > start:
-                try:
-                    respond_json = json.loads(raw[start: end])
-                except Exception as e:
-                    debug("解析失败", str(e))
-
-        # 容错降级：如果模型偶尔输出纯对话文本而未包含标准 JSON 结构，提取文字自动适配默认立绘与场景
-        if not respond_json:
-            clean_txt = remove_emojis(raw).strip()
-            if clean_txt.startswith('"') and clean_txt.endswith('"'):
-                clean_txt = clean_txt[1:-1].strip()
-            if clean_txt:
-                respond_json = {
-                    "where": "小菊卧室白天",
-                    "face": "温柔-说",
-                    "body": "便服单叉腰",
-                    "text": clean_txt,
-                    "bgm": "",
-                    "sfx": ""
-                }
+        respond_json = parse_scene(raw, clean_text=remove_emojis)
 
         if not respond_json:
             debug("解释失败", "in chat_then_parse respond_json")
             return {}
-
-        if "text" in respond_json:
-            respond_json["text"] = remove_emojis(respond_json["text"])
 
         # next（角色立绘加载）移至主线程执行，避免子线程 SDL2 Surface 锁争用
         return respond_json
@@ -546,13 +530,13 @@ class DaisyMo(object):
 
         back = (
             pygame.image.load(back_pic_path).convert()
-            if Screen.last_back_path != back_pic_path or Screen.default_back is None
-            else Screen.default_back
+            if DaisyMo.last_back_path != back_pic_path or DaisyMo.default_back is None
+            else DaisyMo.default_back
         )
 
         DaisyMo.last_face_path = face_pic_path
         DaisyMo.last_body_path = body_pic_path
-        Screen.last_back_path = back_pic_path
+        DaisyMo.last_back_path = back_pic_path
 
         if DaisyMo.ratio != 1.0:
             if need_scale_face:
@@ -562,7 +546,7 @@ class DaisyMo(object):
 
         DaisyMo.photos.clear()
         DaisyMo.photos.append((face, body))
-        Screen.default_back = back
+        DaisyMo.default_back = back
         DaisyMo.text = remove_emojis(respond_json.get("text", "【回答失败！】"))
 
         return respond_json
@@ -571,27 +555,13 @@ class DaisyMo(object):
         Thread(target=daisymo.save, name="daisymo_auto_save").start()
 
     def save(daisymo) -> bool:
-        save_file_path: str = "assets/DaisyMo_history.json"
-        temp_file_path: str = "assets/DaisyMo_history.json.tmp"
-
+        """
+        落盘只此一条路径：临时文件 + 原子替换的实现收在 history_mgr 里，
+        这里不再自己拼一份 JSON（否则同一个存档文件会有两个写入者）。
+        锁保留在这里，因为 auto_save 是放到线程里跑的。
+        """
         with DaisyMo.save_lock:
-            try:
-                valid_mem = [m for m in DaisyMo.memory if m.get("role") in ("user", "assistant")]
-                soul: str = json.dumps(valid_mem, ensure_ascii=False, indent=2)
-                with open(temp_file_path, 'w', encoding="utf-8") as save_file:
-                    save_file.write(soul)
-                os_replace(temp_file_path, save_file_path)
-            except Exception as e:
-                debug("保存历史失败", str(e))
-                return False
-
-        return True
-
-        return True
-
-    def load(daisymo, soul: str) -> Self:
-        DaisyMo.memory = json.loads(soul)
-        return daisymo
+            return history_mgr.save_active_history(daisymo.conversation.messages())
 
     def parse(daisymo, content: str) -> Dict[str, str] | List[Dict[str, str]]:
         return json.loads(content)
@@ -630,11 +600,7 @@ class DaisyMo(object):
                 [f"assets/bg/{e}" for e in listdir("assets/bg")]
             )
         random_back_path = choice(DaisyMo.random_back_cache)
-        Screen.default_back = pygame.image.load(random_back_path).convert()
-
-    def last_chat(daisymo, response: List[Dict[str, str]]) -> Dict[str, str]:
-        DaisyMo.memory.extend(response)
-        return daisymo.parse(response[-1].get("content", '{}'))
+        DaisyMo.default_back = pygame.image.load(random_back_path).convert()
 
 
 class Mixer(object):
@@ -672,8 +638,6 @@ class Mixer(object):
 class Screen(object):
 
     default_size: Tuple[int, int]         = (1280, 720)
-    default_back: pygame.SurfaceType      = None
-    last_back_path: str                   = ''
     FPS: int                              = 30
 
     font: pygame.font.FontType            = None   # 对白字体 22px
@@ -705,6 +669,9 @@ class Screen(object):
         self.init()
 
     def init(self) -> NoReturn:
+        # 聊天记录的所有者：整个程序只造这一个，注入给 DaisyMo
+        self.conversation: Conversation = Conversation()
+
         # 字体加载
         font_cn_med = "assets/font/SourceHanSansCN-Medium.otf"
         font_cn_reg = "assets/font/SourceHanSansCN-Regular.otf"
@@ -745,19 +712,40 @@ class Screen(object):
         self.btn_lock_normal = pygame.image.load("assets/ui/main_btn_locked_normal.png").convert_alpha()
         self.btn_lock_over = pygame.image.load("assets/ui/main_btn_locked_over.png").convert_alpha()
 
+        # ---- 回忆界面 (history_menu) 静态素材：加载一次缓存，避免每次进界面重新解析 ----
+        # OTF 字体 Font() 解析 ~150ms/个，8 个字号 = 1.25s，是「点 log 卡」的元凶
+        self.bg_backlog = pygame.image.load("assets/ui/backlog_botm.png").convert()
+        self.btn_slider = pygame.image.load("assets/ui/backlog_slider.png").convert_alpha()
+        self.btn_back_normal = pygame.image.load("assets/ui/common_btn_back_normal.png").convert_alpha()
+        self.btn_back_over = pygame.image.load("assets/ui/common_btn_back_over.png").convert_alpha()
+        self.btn_fav_normal = pygame.image.load("assets/ui/common_btn_favorite_normal.png").convert_alpha()
+        self.btn_fav_over = pygame.image.load("assets/ui/common_btn_favorite_over.png").convert_alpha()
+        self.btn_voice_normal = pygame.image.load("assets/ui/common_btn_voice_normal.png").convert_alpha()
+        self.card_title_font = pygame.font.Font(font_cn_med, 16)
+        self.card_sub_font = pygame.font.Font(font_cn_med, 12)
+        self.card_tag_font = pygame.font.Font(font_cn_med, 11)
+        self.dia_title_font = pygame.font.Font(font_cn_med, 18)
+        self.dia_sub_font = pygame.font.Font(font_cn_med, 13)
+        self.dia_sub2_font = pygame.font.Font(font_cn_med, 12)
+        self.dia_btn_font = pygame.font.Font(font_cn_med, 14)
+        self.dia_input_font = pygame.font.Font(font_cn_med, 17)
+
+        # ---- 标题屏 (title) 静态素材：同样缓存，避免每次进标题屏重新解析 11 个字体 ----
+        self.title_end_m = pygame.image.load("assets/ui/title_end_m.jpg").convert()
+        self.hero_title_font = pygame.font.Font(font_cn_med, 20)
+        self.hero_sub_font = pygame.font.Font(font_cn_med, 10)
+        self.dock_cn_font = pygame.font.Font(font_cn_med, 13)
+        self.dock_en_font = pygame.font.Font(font_cn_med, 9)
+        self.meta_en_font = pygame.font.Font(font_cn_med, 11)
+        self.meta_sub_font = pygame.font.Font(font_cn_med, 9)
+        self.meta_version_font = pygame.font.Font(font_cn_med, 12)
+        self.dialog_title_font = pygame.font.Font(font_cn_med, 17)
+        self.dialog_sub_font = pygame.font.Font(font_cn_med, 13)
+        self.dialog_sub2_font = pygame.font.Font(font_cn_med, 12)
+        self.btn_font = pygame.font.Font(font_cn_med, 13)
+
         # 对话框状态机与自治文本输入控件
-        self.mode: int = DAISYMO                 # DAISYMO (1) | PLAYER (0)
-        self.ui_hidden: bool = False
-        self.is_auto: bool = False
-        self.is_thinking: bool = False
-        self.thinking_start_time: float = 0.0
-        self.current_req_id: int = 0
-        self.player_input: str = ""
-        self.player_cursor: int = 0
-        self.player_sel_start: int = 0
-        self.player_sel_end: int = 0
-        self.player_dragging: bool = False
-        self.player_last_click_time: float = 0.0
+        self.ui: UiState = UiState(mode=DAISYMO)
 
         self.player_box: TextInputBox = TextInputBox(
             rect=pygame.Rect(230, 604, 760, 64),
@@ -772,34 +760,43 @@ class Screen(object):
             max_lines=2
         )
 
-        # TTS 语音与珍藏浮动提示状态
-        self.is_voice_playing: bool = False
-        self.is_tts_loading: bool = False
-        self.current_playing_text: str = ""
-        self.tts_req_id: int = 0
-        self.voice_channel: Optional[pygame.mixer.Channel] = None
-        self.toast_text: str = ""
-        self.toast_time: float = 0.0
-        self.ui_hidden_time: float = 0.0
-
-        # 打字机动效状态
-        self.current_text: str = ""
-        self.display_text: str = ""
-        self.current_text_index: int = 0
-        self.typewriter_interval: float = 0.028
-        self.last_type_time: float = 0.0
-        self.typewriter_done: bool = False
-
         # 异步线程通信队列
         self.chat_queue: Queue = Queue()
+
+        # 全屏淡入过渡（如从回忆界面返回主界面时）
+        self._fade_mask: Optional[pygame.SurfaceType] = None
 
         self.mixer: Mixer = Mixer()
         self.mixer.air()
 
     def show_toast(self, text: str) -> None:
         """显示纯文本轻量浮动提示（无 Emoji）"""
-        self.toast_text = remove_emojis(text).strip()
-        self.toast_time = time()
+        self.ui.toast_text = remove_emojis(text).strip()
+        self.ui.toast_time = time()
+
+    def start_fade_in(self, duration: float = 0.35) -> None:
+        """启动一次全屏淡入：从纯黑遮罩渐变到透明"""
+        self.ui.fade_alpha = 255.0
+        self.ui.fade_start_time = time()
+        self.ui.fade_duration = max(0.05, duration)
+
+    def render_fade_overlay(self) -> None:
+        """按时间推进淡入并在屏幕上叠加遮罩，alpha 归零后自动停用"""
+        if self.ui.fade_alpha <= 0.0:
+            return
+
+        elapsed = time() - self.ui.fade_start_time
+        if elapsed >= self.ui.fade_duration:
+            self.ui.fade_alpha = 0.0
+            return
+
+        self.ui.fade_alpha = 255.0 * (1.0 - elapsed / self.ui.fade_duration)
+
+        size = self.screen.get_size()
+        if self._fade_mask is None or self._fade_mask.get_size() != size:
+            self._fade_mask = pygame.Surface(size, pygame.SRCALPHA)
+        self._fade_mask.fill((0, 0, 0, int(self.ui.fade_alpha)))
+        self.screen.blit(self._fade_mask, (0, 0))
 
     @staticmethod
     def synthesize_tts_to_file(base_url: str, model_name: str, api_key: str, voice_name: str, text: str, output_path: str) -> Tuple[bool, str]:
@@ -819,23 +816,23 @@ class Screen(object):
         is_same_text = (getattr(self, "current_playing_text", "") == clean_text)
 
         # 每次发起新语音或打断时，独占递增全局请求版本号
-        self.tts_req_id += 1
-        my_req_id = self.tts_req_id
+        self.ui.tts_req_id += 1
+        my_req_id = self.ui.tts_req_id
 
         # 主线程立即切断当前通道上的任何旧声音，避免与新音频重叠
-        if self.voice_channel:
+        if self.ui.voice_channel:
             try:
-                self.voice_channel.stop()
+                self.ui.voice_channel.stop()
             except Exception:
                 pass
 
         # 独占打断机制：
         # 若点击的是正在播放/解析的【同一条】语音，执行暂停打断并恢复常态；
         # 若点击的是【另一条不同】语音，上一条已在上方被停掉，直接继续启动新语音播放！
-        if (self.is_tts_loading or self.is_voice_playing) and is_same_text and not force_refresh:
-            self.is_tts_loading = False
-            self.is_voice_playing = False
-            self.current_playing_text = ""
+        if (self.ui.is_tts_loading or self.ui.is_voice_playing) and is_same_text and not force_refresh:
+            self.ui.is_tts_loading = False
+            self.ui.is_voice_playing = False
+            self.ui.current_playing_text = ""
             self.show_toast("语音已停止")
             return
 
@@ -854,24 +851,24 @@ class Screen(object):
         if os_path.exists(cache_file) and os_path.getsize(cache_file) > 100 and not force_refresh:
             try:
                 sound = pygame.mixer.Sound(cache_file)
-                if not self.voice_channel:
-                    self.voice_channel = pygame.mixer.Channel(1)
-                self.voice_channel.set_volume(DaisyMo.voice_volume)
-                self.is_tts_loading = False
-                self.is_voice_playing = True
-                self.current_playing_text = clean_text
-                self.voice_channel.play(sound)
+                if not self.ui.voice_channel:
+                    self.ui.voice_channel = pygame.mixer.Channel(1)
+                self.ui.voice_channel.set_volume(DaisyMo.voice_volume)
+                self.ui.is_tts_loading = False
+                self.ui.is_voice_playing = True
+                self.ui.current_playing_text = clean_text
+                self.ui.voice_channel.play(sound)
 
                 def _monitor_cached():
-                    while self.voice_channel and self.voice_channel.get_busy():
-                        if my_req_id != self.tts_req_id:
-                            # 关键：新请求已接管通道，旧线程静默退出，严禁调用 self.voice_channel.stop()
+                    while self.ui.voice_channel and self.ui.voice_channel.get_busy():
+                        if my_req_id != self.ui.tts_req_id:
+                            # 关键：新请求已接管通道，旧线程静默退出，严禁调用 self.ui.voice_channel.stop()
                             break
                         pygame.time.wait(30)
                     # 只有当前线程仍然持有最新有效请求版本时，才重置全局状态
-                    if my_req_id == self.tts_req_id:
-                        self.is_voice_playing = False
-                        self.current_playing_text = ""
+                    if my_req_id == self.ui.tts_req_id:
+                        self.ui.is_voice_playing = False
+                        self.ui.current_playing_text = ""
 
                 Thread(target=_monitor_cached, daemon=True).start()
                 self.show_toast("播放语音 (本地缓存)")
@@ -881,9 +878,9 @@ class Screen(object):
                 pass
 
         # 重新生成或缓存未命中：发起异步 API 合成并写入本地缓存
-        self.is_tts_loading = True
-        self.is_voice_playing = False
-        self.current_playing_text = clean_text
+        self.ui.is_tts_loading = True
+        self.ui.is_voice_playing = False
+        self.ui.current_playing_text = clean_text
         self.show_toast("正在重新生成语音..." if force_refresh else "正在合成语音...")
 
         def _tts_worker():
@@ -898,39 +895,39 @@ class Screen(object):
                     output_path=tmp_audio
                 )
                 # 检查等待期间是否已被用户切换或打断
-                if my_req_id != self.tts_req_id:
+                if my_req_id != self.ui.tts_req_id:
                     return
 
                 if ok:
                     sound = pygame.mixer.Sound(tmp_audio)
-                    if not self.voice_channel:
-                        self.voice_channel = pygame.mixer.Channel(1)
-                    self.voice_channel.set_volume(DaisyMo.voice_volume)
+                    if not self.ui.voice_channel:
+                        self.ui.voice_channel = pygame.mixer.Channel(1)
+                    self.ui.voice_channel.set_volume(DaisyMo.voice_volume)
 
-                    self.is_tts_loading = False
-                    self.is_voice_playing = True
-                    self.current_playing_text = clean_text
-                    self.voice_channel.play(sound)
-                    while self.voice_channel and self.voice_channel.get_busy():
-                        if my_req_id != self.tts_req_id:
-                            # 关键：新请求已接管通道，旧线程静默退出，严禁调用 self.voice_channel.stop()
+                    self.ui.is_tts_loading = False
+                    self.ui.is_voice_playing = True
+                    self.ui.current_playing_text = clean_text
+                    self.ui.voice_channel.play(sound)
+                    while self.ui.voice_channel and self.ui.voice_channel.get_busy():
+                        if my_req_id != self.ui.tts_req_id:
+                            # 关键：新请求已接管通道，旧线程静默退出，严禁调用 self.ui.voice_channel.stop()
                             break
                         pygame.time.wait(30)
                 else:
-                    if my_req_id == self.tts_req_id:
+                    if my_req_id == self.ui.tts_req_id:
                         self.show_toast(msg)
             except Exception as ex:
-                if my_req_id == self.tts_req_id:
+                if my_req_id == self.ui.tts_req_id:
                     err_str = str(ex)
                     if "Connection" in err_str:
                         self.show_toast("TTS 错误: 无法连接服务")
                     else:
                         self.show_toast(f"TTS 错误: {err_str[:16]}")
             finally:
-                if my_req_id == self.tts_req_id:
-                    self.is_tts_loading = False
-                    self.is_voice_playing = False
-                    self.current_playing_text = ""
+                if my_req_id == self.ui.tts_req_id:
+                    self.ui.is_tts_loading = False
+                    self.ui.is_voice_playing = False
+                    self.ui.current_playing_text = ""
 
         Thread(target=_tts_worker, daemon=True).start()
 
@@ -940,21 +937,20 @@ class Screen(object):
         pygame.event.clear()
         clock: pygame.time.Clock = pygame.time.Clock()
         is_running: bool = True
-        back: pygame.SurfaceType = pygame.image.load("assets/ui/title_end_m.jpg").convert()
+        # 背景与全套字体已在 Screen.init 缓存，这里只做别名引用，避免每次进标题屏重新解析
+        back: pygame.SurfaceType = self.title_end_m
 
-        # 提前加载全套思源黑体抗锯齿字体（置于视频播放之前，消除跳过或播放完后的毫秒级卡顿顿挫）
-        font_cn_med = "assets/font/SourceHanSansCN-Medium.otf"
-        hero_title_font = pygame.font.Font(font_cn_med, 20)
-        hero_sub_font = pygame.font.Font(font_cn_med, 10)
-        dock_cn_font = pygame.font.Font(font_cn_med, 13)
-        dock_en_font = pygame.font.Font(font_cn_med, 9)
-        meta_en_font = pygame.font.Font(font_cn_med, 11)
-        meta_sub_font = pygame.font.Font(font_cn_med, 9)
-        meta_version_font = pygame.font.Font(font_cn_med, 12)
-        dialog_title_font = pygame.font.Font(font_cn_med, 17)
-        dialog_sub_font = pygame.font.Font(font_cn_med, 13)
-        dialog_sub2_font = pygame.font.Font(font_cn_med, 12)
-        btn_font = pygame.font.Font(font_cn_med, 13)
+        hero_title_font = self.hero_title_font
+        hero_sub_font = self.hero_sub_font
+        dock_cn_font = self.dock_cn_font
+        dock_en_font = self.dock_en_font
+        meta_en_font = self.meta_en_font
+        meta_sub_font = self.meta_sub_font
+        meta_version_font = self.meta_version_font
+        dialog_title_font = self.dialog_title_font
+        dialog_sub_font = self.dialog_sub_font
+        dialog_sub2_font = self.dialog_sub2_font
+        btn_font = self.btn_font
 
         def _render_spaced_text(font: pygame.font.Font, text: str, color: Tuple[int, int, int], spacing: int = 0) -> pygame.Surface:
             if not text:
@@ -1249,7 +1245,11 @@ class Screen(object):
                             elif rect_dock_items[0].collidepoint(mx, my):
                                 self.system_menu()
                             elif rect_dock_items[1].collidepoint(mx, my):
-                                self.history_menu()
+                                # 从标题屏进回忆：载入分支或清空记录后（返回 True）才同步并开始游戏；
+                                # 仅浏览不操作（返回 False）则留在标题屏
+                                if self.history_menu():
+                                    self.sync_after_history_reload()
+                                    is_running = False
                             elif rect_dock_items[2].collidepoint(mx, my):
                                 exit_dialog_open = True
 
@@ -1320,50 +1320,67 @@ class Screen(object):
         pygame.display.flip()
 
         if not hasattr(self, 'daisymo') or self.daisymo is None:
-            self.daisymo = DaisyMo(on_first_meet=None)
+            self.daisymo = DaisyMo(self.conversation, on_first_meet=None)
         pygame.event.clear()
         return self
 
     def wrap_text(self, font: pygame.font.FontType, text: str, max_width: int) -> List[str]:
-        """将长文本按照指定像素宽度折行"""
+        """将长文本按照指定像素宽度折行（二分查找断点，O(n log n)）
+
+        旧实现逐字符拼串调 font.size()，是 O(n²)；中文 OTF 的 size() ~143µs/次，
+        长对白会在「进回忆界面折行」与「打字机每帧折行」两处造成明显卡顿。
+        """
+        if not text:
+            return []
+
         lines: List[str] = []
-        current_line: str = ''
-        for ch in text:
-            test_line = current_line + ch
-            if font.size(test_line)[0] > max_width and current_line:
-                lines.append(current_line)
-                current_line = ch
+        n = len(text)
+        lo = 0
+        while lo < n:
+            # 二分查找 [lo, n] 内能放下的最大前缀末尾
+            low, high = lo, n
+            best = lo
+            while low <= high:
+                mid = (low + high) // 2
+                if font.size(text[lo:mid])[0] <= max_width:
+                    best = mid
+                    low = mid + 1
+                else:
+                    high = mid - 1
+            if best <= lo:
+                # 连一个字符都放不下，强制放一个，避免死循环
+                lines.append(text[lo:lo + 1])
+                lo += 1
             else:
-                current_line = test_line
-        if current_line:
-            lines.append(current_line)
+                lines.append(text[lo:best])
+                lo = best
         return lines
 
     def start_typewriter(self, text: str) -> None:
         """启动打字机"""
-        self.current_text = text
-        self.display_text = ""
-        self.current_text_index = 0
-        self.last_type_time = time()
-        self.typewriter_done = False
+        self.ui.current_text = text
+        self.ui.display_text = ""
+        self.ui.current_text_index = 0
+        self.ui.last_type_time = time()
+        self.ui.typewriter_done = False
         if hasattr(self, 'dialogue_scrollbar') and self.dialogue_scrollbar:
             self.dialogue_scrollbar.reset()
 
     def step_typewriter(self) -> None:
         """更新打字机字数"""
-        if self.current_text_index < len(self.current_text):
-            if time() - self.last_type_time >= self.typewriter_interval:
-                self.current_text_index += 1
-                self.display_text = self.current_text[: self.current_text_index]
-                self.last_type_time = time()
+        if self.ui.current_text_index < len(self.ui.current_text):
+            if time() - self.ui.last_type_time >= self.ui.typewriter_interval:
+                self.ui.current_text_index += 1
+                self.ui.display_text = self.ui.current_text[: self.ui.current_text_index]
+                self.ui.last_type_time = time()
         else:
-            self.typewriter_done = True
+            self.ui.typewriter_done = True
 
     def skip_typewriter(self) -> None:
         """快速显示全部对白"""
-        self.current_text_index = len(self.current_text)
-        self.display_text = self.current_text
-        self.typewriter_done = True
+        self.ui.current_text_index = len(self.ui.current_text)
+        self.ui.display_text = self.ui.current_text
+        self.ui.typewriter_done = True
 
     def draw_text_shadow(self, surface: pygame.SurfaceType, font: pygame.font.FontType,
                          text: str, pos: Tuple[int, int], color: Tuple[int, int, int],
@@ -1377,24 +1394,70 @@ class Screen(object):
 
     def set_mode(self, new_mode: int) -> None:
         """切换发言与对白模式，并统一输入法与键盘长按重复状态"""
-        self.mode = new_mode
+        self.ui.mode = new_mode
         if hasattr(self, 'player_box'):
-            self.player_box.is_active = (self.mode == PLAYER)
-            if self.mode == PLAYER:
+            self.player_box.is_active = (self.ui.mode == PLAYER)
+            if self.ui.mode == PLAYER:
                 self.player_box.cursor = len(self.player_box.text)
                 self.player_box.sel_start = self.player_box.cursor
                 self.player_box.sel_end = self.player_box.cursor
-        if self.mode == PLAYER:
+        if self.ui.mode == PLAYER:
             pygame.key.start_text_input()
             pygame.key.set_repeat(300, 35)
-            self.player_cursor = len(self.player_input)
-            self.player_sel_start = self.player_cursor
-            self.player_sel_end = self.player_cursor
-            self.player_dragging = False
+            self.ui.player_cursor = len(self.ui.player_input)
+            self.ui.player_sel_start = self.ui.player_cursor
+            self.ui.player_sel_end = self.ui.player_cursor
+            self.ui.player_dragging = False
         else:
             pygame.key.stop_text_input()
             pygame.key.set_repeat(0)
-            self.player_dragging = False
+            self.ui.player_dragging = False
+
+    def sync_after_history_reload(self) -> None:
+        """从回忆界面清空或载入新分支后，实时热同步小菊立绘、背景、对白与视口状态"""
+        if not hasattr(self, 'daisymo') or self.daisymo is None:
+            self.daisymo = DaisyMo(self.conversation, on_first_meet=None)
+
+        # 1. 若聊天记录被清空
+        if not self.conversation:
+            init_res = {
+                "where": "小菊卧室白天",
+                "face": "狡猾-说",
+                "body": "便服单叉腰",
+                "text": "呼……笨蛋邱诚，发什么呆呢？有什么想跟姐姐说的吗？",
+                "bgm": "",
+                "sfx": ""
+            }
+            self.daisymo.next(init_res)
+            self.set_mode(DAISYMO)
+            self.start_typewriter(DaisyMo.text)
+            if hasattr(self, "dialogue_scrollbar") and self.dialogue_scrollbar:
+                self.dialogue_scrollbar.reset()
+            if hasattr(self, "player_box") and self.player_box:
+                self.player_box.text = ""
+                self.player_box.cursor = 0
+                self.player_box.sel_start = 0
+                self.player_box.sel_end = 0
+            return
+
+        # 2. 若载入了历史分支，恢复最后一条小菊发言的立绘与场景
+        for m in reversed(self.conversation.messages()):
+            if m.get("role") == "assistant":
+                p = parse_scene(m.get("content", ""), clean_text=remove_emojis)
+                if p and p.get("text"):
+                    self.daisymo.next(p)
+                    break
+
+        self.set_mode(DAISYMO)
+        self.start_typewriter(DaisyMo.text)
+        self.skip_typewriter()
+        if hasattr(self, "dialogue_scrollbar") and self.dialogue_scrollbar:
+            self.dialogue_scrollbar.reset()
+        if hasattr(self, "player_box") and self.player_box:
+            self.player_box.text = ""
+            self.player_box.cursor = 0
+            self.player_box.sel_start = 0
+            self.player_box.sel_end = 0
 
     def main(self) -> str:
         """主游戏对话循环"""
@@ -1412,8 +1475,8 @@ class Screen(object):
         # 首次启动且无 API Key，唤醒设置
         if DaisyMo.first_meet:
             # 预绘一帧游戏底图，供弹窗获取高质量静态快照背景
-            if Screen.default_back:
-                self.screen.blit(Screen.default_back, (0, 0))
+            if DaisyMo.default_back:
+                self.screen.blit(DaisyMo.default_back, (0, 0))
             if self.daisymo.photos:
                 for each in DaisyMo.photos:
                     self.screen.blits(((each[1], DaisyMo.offset), (each[0], DaisyMo.offset)))
@@ -1451,7 +1514,7 @@ class Screen(object):
             mouse_x, mouse_y = pygame.mouse.get_pos()
 
             # 检查异步回复与思考超时（1分钟超时保护）
-            if self.is_thinking:
+            if self.ui.is_thinking:
                 if not self.chat_queue.empty():
                     q_item = self.chat_queue.get()
                     if isinstance(q_item, tuple):
@@ -1461,7 +1524,7 @@ class Screen(object):
 
                     # 仅接收当前请求的最新响应，抛弃超时的旧响应
                     if req_id == getattr(self, "current_req_id", 0):
-                        self.is_thinking = False
+                        self.ui.is_thinking = False
                         if not res:
                             self.start_typewriter("……唔，网络或者API配置好像有点问题，没连上。你去检查一下设置吧！")
                         else:
@@ -1474,8 +1537,8 @@ class Screen(object):
 
                 elif time() - getattr(self, "thinking_start_time", time()) > 60.0:
                     # 1 分钟超时未响应保护
-                    self.is_thinking = False
-                    self.current_req_id = getattr(self, "current_req_id", 0) + 1
+                    self.ui.is_thinking = False
+                    self.ui.current_req_id = getattr(self, "current_req_id", 0) + 1
                     while not self.chat_queue.empty():
                         try:
                             self.chat_queue.get_nowait()
@@ -1485,9 +1548,9 @@ class Screen(object):
                 else:
                     # 思考中的动态提示动效（点动循环：. -> .. -> ...）
                     dots = int((time() * 2.5) % 3) + 1
-                    self.display_text = f"『 墨小菊正在思考{'.' * dots} 』"
+                    self.ui.display_text = f"『 墨小菊正在思考{'.' * dots} 』"
 
-            if not self.is_thinking:
+            if not self.ui.is_thinking:
                 self.step_typewriter()
 
             # 事件循环
@@ -1497,16 +1560,16 @@ class Screen(object):
                     break
 
                 # UI 隐藏时，任意键/点击均唤回
-                if self.ui_hidden:
+                if self.ui.ui_hidden:
                     if event.type == MOUSEBUTTONDOWN or event.type == KEYDOWN:
-                        self.ui_hidden = False
+                        self.ui.ui_hidden = False
                     continue
 
                 in_dialogue = rect_dialogue_box.collidepoint(mouse_x, mouse_y) or self.dialogue_scrollbar.rect.collidepoint(mouse_x, mouse_y)
 
                 # 滚轮事件（现代 Pygame MOUSEWHEEL，光标在对话区即可触发，绝不向下穿透为点击）
                 if event.type == pygame.MOUSEWHEEL:
-                    if self.mode == DAISYMO and in_dialogue:
+                    if self.ui.mode == DAISYMO and in_dialogue:
                         self.dialogue_scrollbar.handle_event(event, mouse_x, mouse_y, in_dialogue_area=True)
                     continue
 
@@ -1515,12 +1578,12 @@ class Screen(object):
 
                     # 传统滚轮事件分流（Button 4 向上，Button 5 向下，无条件阻断，绝不穿透为点击）
                     if event.button in (4, 5):
-                        if self.mode == DAISYMO and in_dialogue:
+                        if self.ui.mode == DAISYMO and in_dialogue:
                             self.dialogue_scrollbar.handle_event(event, mx, my, in_dialogue_area=True)
                         continue
 
                     # 滚动条滑块拖拽与轨道点击（仅左键点击滚动条区域时拦截）
-                    if self.mode == DAISYMO and self.dialogue_scrollbar.is_visible:
+                    if self.ui.mode == DAISYMO and self.dialogue_scrollbar.is_visible:
                         thumb_rect = self.dialogue_scrollbar._get_thumb_rect()
                         if self.dialogue_scrollbar.rect.collidepoint(mx, my) or thumb_rect.collidepoint(mx, my):
                             self.dialogue_scrollbar.handle_event(event, mx, my, in_dialogue_area=in_dialogue)
@@ -1532,79 +1595,82 @@ class Screen(object):
 
                     # 1. 底部功能栏点击
                     if rect_auto.collidepoint(mx, my):
-                        self.is_auto = not self.is_auto
+                        self.ui.is_auto = not self.ui.is_auto
                     elif rect_skip.collidepoint(mx, my):
-                        if self.is_thinking:
+                        if self.ui.is_thinking:
                             continue  # 思考保护：思考中禁止快进
-                        if not self.typewriter_done:
+                        if not self.ui.typewriter_done:
                             self.skip_typewriter()
                         else:
                             self.set_mode(PLAYER)
                     elif rect_log.collidepoint(mx, my):
-                        self.history_menu()
+                        if self.history_menu():
+                            self.sync_after_history_reload()
+                        # 从回忆界面回到主界面时做一次全屏淡入
+                        self.start_fade_in()
                     elif rect_sys.collidepoint(mx, my):
                         res = self.system_menu()
                         if res == "title":
                             return "title"
                     elif rect_lock.collidepoint(mx, my):
-                        self.ui_hidden = True
-                        self.ui_hidden_time = time()
+                        self.ui.ui_hidden = True
+                        self.ui.ui_hidden_time = time()
 
                     # 2. 铭牌珍藏、语音播放与重新生成按钮
                     elif rect_favorite.collidepoint(mx, my):
-                        cur_dialogue = self.display_text if self.mode == DAISYMO else DaisyMo.text
-                        if cur_dialogue and not self.is_thinking:
+                        cur_dialogue = self.ui.display_text if self.ui.mode == DAISYMO else DaisyMo.text
+                        if cur_dialogue and not self.ui.is_thinking:
                             is_fav = DaisyMo.toggle_favorite(cur_dialogue)
                             self.show_toast("已加入珍藏" if is_fav else "已移出珍藏")
 
                     elif rect_voice.collidepoint(mx, my):
-                        cur_dialogue = self.display_text if self.mode == DAISYMO else DaisyMo.text
+                        cur_dialogue = self.ui.display_text if self.ui.mode == DAISYMO else DaisyMo.text
                         # 若当前正在加载解析或正在朗读，点击即可独占打断！空闲时则播放(优先读取本地缓存)
-                        if (self.is_tts_loading or self.is_voice_playing) or (cur_dialogue and not self.is_thinking):
+                        if (self.ui.is_tts_loading or self.ui.is_voice_playing) or (cur_dialogue and not self.ui.is_thinking):
                             self.play_tts_voice(cur_dialogue, force_refresh=False)
 
                     elif rect_revoice.collidepoint(mx, my):
-                        cur_dialogue = self.display_text if self.mode == DAISYMO else DaisyMo.text
+                        cur_dialogue = self.ui.display_text if self.ui.mode == DAISYMO else DaisyMo.text
                         # 重新生成语音：绕过缓存并强制重新请求 API 合成新音频
-                        if cur_dialogue and not self.is_thinking:
+                        if cur_dialogue and not self.ui.is_thinking:
                             self.play_tts_voice(cur_dialogue, force_refresh=True)
 
                     # 2. 发言模式切换按钮
                     elif rect_mode_toggle.collidepoint(mx, my):
-                        if self.is_thinking:
+                        if self.ui.is_thinking:
                             continue  # 思考保护：思考中禁止切换发言模式
-                        self.set_mode(PLAYER if self.mode == DAISYMO else DAISYMO)
+                        self.set_mode(PLAYER if self.ui.mode == DAISYMO else DAISYMO)
 
                     # 3. 对话框主区域点击
                     elif rect_dialogue_box.collidepoint(mx, my):
-                        if self.is_thinking:
+                        if self.ui.is_thinking:
                             continue  # 思考保护：思考中点击对话框不能继续、不能跳过、不能切入输入模式！
-                        if self.mode == DAISYMO:
-                            if not self.typewriter_done:
+                        if self.ui.mode == DAISYMO:
+                            if not self.ui.typewriter_done:
                                 self.skip_typewriter()
                             else:
                                 self.set_mode(PLAYER)
-                        elif self.mode == PLAYER:
+                        elif self.ui.mode == PLAYER:
                             if rect_send_btn.collidepoint(mx, my):
                                 self._submit_player_message()
                             else:
                                 if self.player_box.handle_event(event, mx, my, self._get_clipboard_text, self._set_clipboard_text):
-                                    self.player_input = self.player_box.text
+                                    self.ui.player_input = self.player_box.text
 
                 elif event.type == MOUSEMOTION:
-                    if self.mode == DAISYMO:
+                    if self.ui.mode == DAISYMO:
                         self.dialogue_scrollbar.handle_event(event, event.pos[0], event.pos[1], in_dialogue_area=in_dialogue)
-                    elif self.mode == PLAYER:
+                    elif self.ui.mode == PLAYER:
                         if self.player_box.handle_event(event, event.pos[0], event.pos[1], self._get_clipboard_text, self._set_clipboard_text):
-                            self.player_input = self.player_box.text
+                            self.ui.player_input = self.player_box.text
 
                 elif event.type == MOUSEBUTTONUP:
                     if event.button == 1:
-                        if self.mode == DAISYMO:
+                        if self.ui.mode == DAISYMO:
                             self.dialogue_scrollbar.handle_event(event, event.pos[0], event.pos[1], in_dialogue_area=in_dialogue)
-                        elif self.mode == PLAYER:
+                        elif self.ui.mode == PLAYER:
                             if self.player_box.handle_event(event, event.pos[0], event.pos[1], self._get_clipboard_text, self._set_clipboard_text):
-                                self.player_input = self.player_box.text
+                                self.ui.player_input = self.player_box.text
 
                 elif event.type == KEYDOWN:
                     if event.key == K_ESCAPE:
@@ -1616,48 +1682,48 @@ class Screen(object):
                             return "title"
 
                     elif event.key == K_TAB:
-                        if self.is_thinking:
+                        if self.ui.is_thinking:
                             continue  # 思考保护：思考中禁止 Tab 切换
-                        self.set_mode(PLAYER if self.mode == DAISYMO else DAISYMO)
+                        self.set_mode(PLAYER if self.ui.mode == DAISYMO else DAISYMO)
 
-                    elif event.key == K_SPACE and self.mode == DAISYMO:
-                        if self.is_thinking:
+                    elif event.key == K_SPACE and self.ui.mode == DAISYMO:
+                        if self.ui.is_thinking:
                             continue  # 思考保护：思考中按空格禁止跳过或切入输入模式
-                        if not self.typewriter_done:
+                        if not self.ui.typewriter_done:
                             self.skip_typewriter()
                         else:
                             self.set_mode(PLAYER)
 
-                    elif self.mode == PLAYER:
+                    elif self.ui.mode == PLAYER:
                         if event.key == K_RETURN:
                             self._submit_player_message()
                         else:
                             if self.player_box.handle_event(event, mx, my, self._get_clipboard_text, self._set_clipboard_text):
-                                self.player_input = self.player_box.text
+                                self.ui.player_input = self.player_box.text
 
-                    elif self.mode == DAISYMO and event.key == K_1:
+                    elif self.ui.mode == DAISYMO and event.key == K_1:
                         self.daisymo.random_face()
-                    elif self.mode == DAISYMO and event.key == K_2:
+                    elif self.ui.mode == DAISYMO and event.key == K_2:
                         self.daisymo.random_body()
-                    elif self.mode == DAISYMO and event.key == K_3:
+                    elif self.ui.mode == DAISYMO and event.key == K_3:
                         self.daisymo.random_back()
 
-                elif event.type == KEYUP and self.mode == PLAYER:
+                elif event.type == KEYUP and self.ui.mode == PLAYER:
                     self.player_box.handle_event(event, mx, my, self._get_clipboard_text, self._set_clipboard_text)
 
-                elif event.type == TEXTINPUT and self.mode == PLAYER:
+                elif event.type == TEXTINPUT and self.ui.mode == PLAYER:
                     if self.player_box.handle_event(event, mx, my, self._get_clipboard_text, self._set_clipboard_text):
-                        self.player_input = self.player_box.text
+                        self.ui.player_input = self.player_box.text
 
             # 长按退格与 Delete 快速连删由 player_box 自治响应
-            if self.mode == PLAYER:
+            if self.ui.mode == PLAYER:
                 if self.player_box.tick_continuous_delete(time()):
-                    self.player_input = self.player_box.text
+                    self.ui.player_input = self.player_box.text
 
             # ----------------- 绘制渲染 -----------------
             # 1. 场景背景与立绘
-            if Screen.default_back:
-                self.screen.blit(Screen.default_back, (0, 0))
+            if DaisyMo.default_back:
+                self.screen.blit(DaisyMo.default_back, (0, 0))
             else:
                 self.screen.fill(BG_DARK)
 
@@ -1666,7 +1732,7 @@ class Screen(object):
                     self.screen.blits(((each[1], DaisyMo.offset), (each[0], DaisyMo.offset)))
 
             # UI 隐藏模式（提示仅在进入前 0.5 秒内显示，超时自动隐去以呈现纯净全屏画面）
-            if self.ui_hidden:
+            if self.ui.ui_hidden:
                 if time() - getattr(self, "ui_hidden_time", 0.0) < 0.5:
                     hint_surf = Screen.dfont.render("〈 点击屏幕任意处恢复界面 〉", True, GOLD_COLOR)
                     hx = (1280 - hint_surf.get_width()) // 2
@@ -1682,7 +1748,7 @@ class Screen(object):
             self.screen.blit(self.main_botm_line, (0, 360))
 
             # 3. 姓名框与图标 (左侧紧凑三联排: 珍藏 133, 播放 165, 重新生成 197)
-            cur_dialogue = self.display_text if self.mode == DAISYMO else DaisyMo.text
+            cur_dialogue = self.ui.display_text if self.ui.mode == DAISYMO else DaisyMo.text
             is_fav = DaisyMo.is_favorited(cur_dialogue)
             fav_hover = rect_favorite.collidepoint(mouse_x, mouse_y)
             self.screen.blit(self.icon_favorite_over if (is_fav or fav_hover) else self.icon_favorite_normal, (133, 564))
@@ -1690,10 +1756,10 @@ class Screen(object):
             # 语音播放图标 (165, 564)：未配置时绝不点亮；解析中显示呼吸加载态；播放中稳定点亮
             is_tts_configured = bool(DaisyMo.tts_base_url.strip())
             voice_hover = rect_voice.collidepoint(mouse_x, mouse_y)
-            if self.is_voice_playing:
+            if self.ui.is_voice_playing:
                 # 正在发音朗读中：稳定点亮态
                 self.screen.blit(self.icon_voice_over, (165, 564))
-            elif self.is_tts_loading:
+            elif self.ui.is_tts_loading:
                 # 正在解析合成中：动态平滑呼吸加载动效 (alpha 100~255)
                 b_alpha = int(100 + 155 * (0.5 + 0.5 * math.sin(time() * 8.0)))
                 tmp_icon = self.icon_voice_over.copy()
@@ -1710,7 +1776,7 @@ class Screen(object):
             revoice_hover = rect_revoice.collidepoint(mouse_x, mouse_y)
             if not is_tts_configured:
                 self.screen.blit(self.icon_revoice_unuseable, (197, 564))
-            elif self.is_tts_loading:
+            elif self.ui.is_tts_loading:
                 b_alpha = int(100 + 155 * (0.5 + 0.5 * math.sin(time() * 8.0)))
                 tmp_icon = self.icon_revoice_over.copy()
                 tmp_icon.set_alpha(b_alpha)
@@ -1723,26 +1789,26 @@ class Screen(object):
             self.screen.blit(self.main_botm_name, (232, 564))
 
             # 姓名文字居中排印 (DAISYMO: 墨小菊; PLAYER: 邱诚)
-            name_text = "墨小菊" if self.mode == DAISYMO else "邱诚"
-            name_color = QCOLOR if self.mode == DAISYMO else GOLD_COLOR
+            name_text = "墨小菊" if self.ui.mode == DAISYMO else "邱诚"
+            name_color = QCOLOR if self.ui.mode == DAISYMO else GOLD_COLOR
             nw, nh = Screen.name_font.size(name_text)
             nx = 232 + (180 - nw) // 2
             ny = 564 + (30 - nh) // 2
             self.draw_text_shadow(self.screen, Screen.name_font, name_text, (nx, ny), name_color)
 
             # 模式切换小胶囊 [Tab]
-            mode_btn_bg = (35, 45, 60) if self.mode == PLAYER else (45, 32, 18)
-            mode_btn_border = (78, 205, 196) if self.mode == PLAYER else (255, 180, 60)
-            mode_btn_text = "[Tab] 查看小菊" if self.mode == PLAYER else "[Tab] 我要发言"
+            mode_btn_bg = (35, 45, 60) if self.ui.mode == PLAYER else (45, 32, 18)
+            mode_btn_border = (78, 205, 196) if self.ui.mode == PLAYER else (255, 180, 60)
+            mode_btn_text = "[Tab] 查看小菊" if self.ui.mode == PLAYER else "[Tab] 我要发言"
             pygame.draw.rect(self.screen, mode_btn_bg, rect_mode_toggle, border_radius=4)
             pygame.draw.rect(self.screen, mode_btn_border, rect_mode_toggle, width=1, border_radius=4)
             mode_txt_surf = Screen.dfont.render(mode_btn_text, True, mode_btn_border)
             self.screen.blit(mode_txt_surf, (rect_mode_toggle.x + 8, rect_mode_toggle.y + 4))
 
             # 4. 对话内容区 (复用同一区域)
-            if self.mode == DAISYMO:
+            if self.ui.mode == DAISYMO:
                 # 状态 A: 墨小菊对白 (逐字打字机 + 滚动条视口切片 + 跳动倒三角)
-                lines = self.wrap_text(Screen.font, self.display_text, 818)
+                lines = self.wrap_text(Screen.font, self.ui.display_text, 818)
                 self.dialogue_scrollbar.update_lines(len(lines))
 
                 start_y = 604
@@ -1756,7 +1822,7 @@ class Screen(object):
                 self.dialogue_scrollbar.render(self.screen)
 
                 # 打字完成后跳动光标：仅在当前视口包含最后一行时显示在行尾
-                if self.typewriter_done and not self.is_thinking and lines:
+                if self.ui.typewriter_done and not self.ui.is_thinking and lines:
                     last_line_idx = len(lines) - 1
                     if scroll_start <= last_line_idx < scroll_start + 3:
                         disp_line_idx = last_line_idx - scroll_start
@@ -1783,7 +1849,7 @@ class Screen(object):
                                             rect_send_btn.y + (rect_send_btn.height - send_txt.get_height()) // 2))
 
             # 5. 官方底部功能栏 (右侧精简：仅保留 SYSTEM 与 隐藏UI锁)
-            self._draw_btn(rect_auto, self.btn_auto_on if self.is_auto else (self.btn_auto_over if rect_auto.collidepoint(mouse_x, mouse_y) else self.btn_auto_normal))
+            self._draw_btn(rect_auto, self.btn_auto_on if self.ui.is_auto else (self.btn_auto_over if rect_auto.collidepoint(mouse_x, mouse_y) else self.btn_auto_normal))
             self._draw_btn(rect_skip, self.btn_skip_over if rect_skip.collidepoint(mouse_x, mouse_y) else self.btn_skip_normal)
             self._draw_btn(rect_log, self.btn_log_over if rect_log.collidepoint(mouse_x, mouse_y) else self.btn_log_normal)
 
@@ -1791,16 +1857,16 @@ class Screen(object):
             self._draw_btn(rect_lock, self.btn_lock_over if rect_lock.collidepoint(mouse_x, mouse_y) else self.btn_lock_normal)
 
             # 浮动提示 Toast (纯文本，无 Emoji)
-            if self.toast_text and (time() - self.toast_time < 2.0):
-                t_surf = Screen.card_font.render(self.toast_text, True, GOLD_COLOR)
+            if self.ui.toast_text and (time() - self.ui.toast_time < 2.0):
+                t_surf = Screen.card_font.render(self.ui.toast_text, True, GOLD_COLOR)
                 tw, th = t_surf.get_size()
                 tx = (1280 - tw) // 2
                 ty = 510
                 pygame.draw.rect(self.screen, (20, 24, 32), (tx - 16, ty - 6, tw + 32, th + 12), border_radius=6)
                 pygame.draw.rect(self.screen, DCOLOR, (tx - 16, ty - 6, tw + 32, th + 12), width=1, border_radius=6)
                 self.screen.blit(t_surf, (tx, ty))
-            elif self.toast_text and (time() - self.toast_time >= 2.0):
-                self.toast_text = ""
+            elif self.ui.toast_text and (time() - self.ui.toast_time >= 2.0):
+                self.ui.toast_text = ""
 
             # 6. 右上角 Token 消耗与状态 HUD 模块（纯文字，无 Emoji）
             self._render_token_hud()
@@ -1810,6 +1876,9 @@ class Screen(object):
                 _fade_surf.set_alpha(fade_in_alpha)
                 self.screen.blit(_fade_surf, (0, 0))
                 fade_in_alpha = max(0, fade_in_alpha - 5)
+
+            # 8. 从回忆界面返回时的全屏淡入（按时间推进，与上面的开局淡入互不干扰）
+            self.render_fade_overlay()
 
             pygame.display.flip()
 
@@ -1854,8 +1923,8 @@ class Screen(object):
 
     def _submit_player_message(self) -> None:
         """提交玩家发言给小菊并转入异步思考"""
-        sent_text = self.player_box.text.strip() if hasattr(self, 'player_box') else self.player_input.strip()
-        if not sent_text or self.is_thinking:
+        sent_text = self.player_box.text.strip() if hasattr(self, 'player_box') else self.ui.player_input.strip()
+        if not sent_text or self.ui.is_thinking:
             return
 
         if hasattr(self, 'player_box'):
@@ -1863,23 +1932,23 @@ class Screen(object):
             self.player_box.cursor = 0
             self.player_box.sel_start = 0
             self.player_box.sel_end = 0
-        self.player_input = ""
-        self.player_cursor = 0
-        self.player_sel_start = 0
-        self.player_sel_end = 0
+        self.ui.player_input = ""
+        self.ui.player_cursor = 0
+        self.ui.player_sel_start = 0
+        self.ui.player_sel_end = 0
 
         if not DaisyMo.api_key:
             self.set_mode(DAISYMO)
-            self.is_thinking = False
+            self.ui.is_thinking = False
             self.start_typewriter("哼，你连 API Key 都没填，姐姐听不见你说话！快去 SYSTEM 设置里填好！")
             return
 
         self.set_mode(DAISYMO)
-        self.is_thinking = True
-        self.thinking_start_time = time()
-        self.current_req_id = getattr(self, "current_req_id", 0) + 1
-        req_id = self.current_req_id
-        self.display_text = "『 墨小菊正在思考... 』"
+        self.ui.is_thinking = True
+        self.ui.thinking_start_time = time()
+        self.ui.current_req_id = getattr(self, "current_req_id", 0) + 1
+        req_id = self.ui.current_req_id
+        self.ui.display_text = "『 墨小菊正在思考... 』"
 
         def _worker():
             res = self.daisymo.chat_then_parse(sent_text)
@@ -1989,19 +2058,51 @@ class Screen(object):
         except Exception:
             pass
 
-    def history_menu(self) -> None:
-        """全屏官方回忆界面 (Backlog，支持「历史」与「珍藏」双标签分栏)"""
-        bg_backlog = pygame.image.load("assets/ui/backlog_botm.png").convert()
-        btn_slider = pygame.image.load("assets/ui/backlog_slider.png").convert_alpha()
-        btn_back_normal = pygame.image.load("assets/ui/common_btn_back_normal.png").convert_alpha()
-        btn_back_over = pygame.image.load("assets/ui/common_btn_back_over.png").convert_alpha()
-        btn_fav_normal = pygame.image.load("assets/ui/common_btn_favorite_normal.png").convert_alpha()
-        btn_fav_over = pygame.image.load("assets/ui/common_btn_favorite_over.png").convert_alpha()
-        btn_voice_normal = pygame.image.load("assets/ui/common_btn_voice_normal.png").convert_alpha()
+    def history_menu(self) -> bool:
+        """全屏官方回忆界面 (Backlog，支持「历史」、「珍藏」与「分支存档」三标签分栏，支持一键备份与安全清空)"""
+        # 静态素材已在 Screen.init 里加载并缓存，这里只做局部别名引用，避免每次进界面重新解析字体/图片
+        bg_backlog = self.bg_backlog
+        btn_slider = self.btn_slider
+        btn_back_normal = self.btn_back_normal
+        btn_back_over = self.btn_back_over
+        btn_fav_normal = self.btn_fav_normal
+        btn_fav_over = self.btn_fav_over
+        btn_voice_normal = self.btn_voice_normal
+        card_title_font = self.card_title_font
+        card_sub_font = self.card_sub_font
+        card_tag_font = self.card_tag_font
+        dia_title_font = self.dia_title_font
+        dia_sub_font = self.dia_sub_font
+        dia_sub2_font = self.dia_sub2_font
+        dia_btn_font = self.dia_btn_font
+        dia_input_font = self.dia_input_font
 
         rect_back = pygame.Rect(1165, 625, 76, 76)
-        rect_tab_hist = pygame.Rect(175, 42, 84, 30)
-        rect_tab_fav = pygame.Rect(270, 42, 110, 30)
+        rect_tab_hist = pygame.Rect(165, 42, 68, 30)
+        rect_tab_fav = pygame.Rect(245, 42, 95, 30)
+        rect_tab_backup = pygame.Rect(350, 42, 115, 30)
+
+        # 顶部操作按钮 (位于右侧空白安全区，避免遮挡中央水印)
+        rect_btn_backup = pygame.Rect(830, 42, 105, 30)
+        rect_btn_clear = pygame.Rect(945, 42, 90, 30)
+        rect_btn_new_backup = pygame.Rect(930, 42, 105, 30)
+
+        confirm_dialog = ConfirmDialog(
+            title_font=dia_title_font,
+            sub_font=dia_sub_font,
+            sub2_font=dia_sub2_font,
+            btn_font=dia_btn_font
+        )
+
+        # 分支存档自定义命名 / 新建备份命名弹窗
+        input_dialog = InputDialog(
+            title_font=dia_title_font,
+            label_font=dia_sub_font,
+            hint_font=dia_sub2_font,
+            btn_font=dia_btn_font,
+            input_font=dia_input_font,
+            max_length=history_mgr.TITLE_MAX_LEN
+        )
 
         # 官方右侧滑道与圆纽扣滑块几何定义 (滑槽居中 x=1090.5, y=87~682, 行程 569px)
         track_top = 87
@@ -2016,155 +2117,358 @@ class Screen(object):
 
         # 确保历史对话与珍藏数据均已加载
         DaisyMo.load_favorites()
-        if not DaisyMo.memory and os_path.exists("assets/DaisyMo_history.json"):
+        if not self.conversation and os_path.exists("assets/DaisyMo_history.json"):
             try:
                 with open("assets/DaisyMo_history.json", 'r', encoding="utf-8") as f:
                     saved_mem = json.load(f)
                 if isinstance(saved_mem, list) and saved_mem:
-                    DaisyMo.memory = [m for m in saved_mem if isinstance(m, dict) and m.get("role") in ("user", "assistant")]
+                    self.conversation.replace_with(saved_mem)
             except Exception:
                 pass
 
-        # 准备历史文本段落（自动过滤 Emoji 与提示词，消灭方块乱码）
         hist_entries = []
-        for msg in DaisyMo.memory:
-            role = msg.get("role")
-            if role == "system":
-                continue
-            content = msg.get("content", "")
-            if role == "user":
-                hist_entries.append(("邱诚", remove_emojis(content).strip(), (18, 100, 90), ""))
-            elif role == "assistant":
-                try:
-                    p = json.loads(content)
-                    txt = p.get("text", "")
-                except Exception:
-                    txt = content
-                hist_entries.append(("墨小菊", remove_emojis(txt).strip(), (190, 95, 0), ""))
-
-        # 预先计算历史对白实际渲染高度，打开回忆界面默认直接滚动到最底部（呈现最新对话）
         curr_calc_y = 10
-        for speaker, text, _, _ in hist_entries:
-            curr_calc_y += Screen.font.size(speaker)[1] + 4
-            lines = self.wrap_text(Screen.dfont, text, 810)
-            for line in lines:
-                curr_calc_y += Screen.dfont.size(line)[1] + 3
-            curr_calc_y += 18
-        curr_calc_y += 16  # 底部呼吸内边距，确保最后一句对白完整舒展呈现
 
+        def refresh_hist_entries() -> None:
+            """
+            重新折行全部对白并缓存成行布局，同时算出内容总高度。
+            只在数据变化时调用 —— 折行结果与 y 坐标随行一起缓存，渲染时不再重算。
+            """
+            nonlocal hist_entries, curr_calc_y
+            hist_entries = []
+            y = 10
+            for msg in self.conversation.messages():
+                role = msg.get("role")
+                if role == "system":
+                    continue
+                content = msg.get("content", "")
+                if role == "user":
+                    speaker, color, text = "邱诚", (18, 100, 90), remove_emojis(content).strip()
+                elif role == "assistant":
+                    speaker, color, text = "墨小菊", (190, 95, 0), remove_emojis(reply_text(content)).strip()
+                else:
+                    continue
+
+                lines = self.wrap_text(Screen.dfont, text, 810)
+                hist_entries.append({
+                    "speaker": speaker,
+                    "text": text,
+                    "color": color,
+                    "y": y,
+                    "lines": lines,
+                })
+                y += Screen.font.size(speaker)[1] + 4
+                for line in lines:
+                    y += Screen.dfont.size(line)[1] + 3
+                y += 18
+            y += 16
+            curr_calc_y = y
+
+        refresh_hist_entries()
         initial_max_scroll = max(0.0, curr_calc_y - paper_rect.height)
 
-        active_tab = "history"  # "history" | "favorites"
+        active_tab = "history"  # "history" | "favorites" | "backups"
         scroll_y: float = -initial_max_scroll
         max_scroll: float = initial_max_scroll
+        hist_dirty: bool = False
         running = True
         clock = pygame.time.Clock()
+
+        # ---- 标签页正文缓存 ----
+        # 每一帧画出来的正文其实完全一样，滚动只是最后那次 blit 的裁剪区在变。
+        # 所以折行与正文表面只在数据变化时重建（dirty 标记），每帧只做 1 次带 clip 的 blit；
+        # 随帧变化的部分（语音喇叭高亮、卡片 hover、按钮态）一律挪出缓存、每帧现画。
+        body_cache: Dict[str, Dict[str, Any]] = {
+            "history": {"surf": None, "max_scroll": 0.0, "rows": [], "dirty": True},
+            "favorites": {"surf": None, "max_scroll": 0.0, "rows": [], "dirty": True},
+            "backups": {"surf": None, "max_scroll": 0.0, "rows": [], "dirty": True},
+        }
+
+        def mark_dirty(*tabs: str) -> None:
+            """置脏：没有参数时全部标签页作废"""
+            for t in (tabs if tabs else tuple(body_cache.keys())):
+                body_cache[t]["dirty"] = True
+
+        # 备份列表的轻量签名：外部（或本界面）任何增删改名都会让签名变化，自动置脏
+        backup_signature: Tuple[Any, ...] = ()
+
+        def sync_backup_signature() -> None:
+            nonlocal backup_signature
+            sig = tuple((b.get("backup_id", ""), b.get("title", "")) for b in history_mgr.list_backups())
+            if sig != backup_signature:
+                backup_signature = sig
+                body_cache["backups"]["dirty"] = True
+
+        def handle_confirm_action(act: str, payload: Any) -> None:
+            nonlocal scroll_y, hist_dirty, running
+            if act == "clear":
+                # 先让数据层读一遍当前记录去生成安全快照（它只读、不再动传入的列表），
+                # 再让所有者自己清空 —— 以前是数据层拿到列表引用就地 clear 的，那个别名坑拆掉了。
+                ok, auto_id = history_mgr.clear_active_history(self.conversation.messages())
+                self.conversation.clear()
+                self.show_toast("对话记录已重置（已自动生成安全快照）" if auto_id
+                                else "对话记录已重置（此前仅是开场白，未留快照）")
+                hist_dirty = True
+                refresh_hist_entries()
+                mark_dirty()
+                scroll_y = 0.0
+            elif act == "load_backup":
+                backup_id = str(payload)
+                if self.conversation:
+                    # 自动快照：同名只保留一条（数据层负责覆盖），且开场白不会留档
+                    history_mgr.create_backup(self.conversation.messages(), is_auto=True, title="切换分支前自动快照")
+                ok, loaded_mem, msg = history_mgr.load_backup(backup_id)
+                if ok:
+                    self.conversation.replace_with(loaded_mem)
+                    history_mgr.save_active_history(self.conversation.messages())
+                    self.show_toast("已成功载入该时间线分支")
+                    hist_dirty = True
+                    refresh_hist_entries()
+                    mark_dirty()
+                    scroll_y = -max_scroll
+                    # 载入完成即自动收起回忆界面，回到主界面（由主循环热同步小菊状态）
+                    running = False
+                else:
+                    self.show_toast(msg)
+            elif act == "delete_backup":
+                backup_id = str(payload)
+                ok, msg = history_mgr.delete_backup(backup_id)
+                self.show_toast("已删除分支存档（可从 .trash 找回）" if ok else msg)
+
+        def open_input_dialog(title: str, label: str, default_text: str, context: Any) -> None:
+            """打开命名弹窗，并同步开启文本输入与输入法候选框锚点"""
+            input_dialog.open(
+                title=title,
+                label=label,
+                default_text=default_text,
+                confirm_text="确认",
+                cancel_text="取消",
+                context=context
+            )
+            pygame.key.start_text_input()
+            pygame.key.set_text_input_rect(input_dialog.rect_input)
+
+        def handle_input_action(act: str, payload: Any) -> None:
+            if act == "rename_backup":
+                b_id, new_title = payload
+                ok, msg = history_mgr.rename_backup(b_id, new_title)
+                self.show_toast(f"已重命名为「{new_title}」" if ok else msg)
+            elif act == "new_backup":
+                if not self.conversation:
+                    self.show_toast("当前暂无对话记录可备份")
+                    return
+                rec = history_mgr.create_backup(self.conversation.messages(), is_auto=False, title=str(payload or ""))
+                if rec:
+                    self.show_toast(f"已创建新分支存档：{rec['title']}")
+
+        def _abs(x: int, y: int, w: int, h: int) -> pygame.Rect:
+            """正文面内坐标 -> 屏幕坐标（供点击热区使用）"""
+            return pygame.Rect(paper_rect.x + x, paper_rect.y + y + int(scroll_y), w, h)
 
         while running:
             clock.tick(30)
             mx, my = pygame.mouse.get_pos()
+            click_actions = []
 
-            # 白纸安全区与可点击按钮热区收集
-            click_actions = []  # list of (rect_on_screen, action_type, text_content)
+            backup_list = history_mgr.list_backups()
+            sync_backup_signature()
 
-            # 动态计算表面高度并绘制内容
+            # 每帧现画的动态层：卡片底/边框要画在缓存正文之下，图标与按钮画在其上
+            icon_blits: List[Tuple[pygame.SurfaceType, pygame.Rect]] = []
+            backup_chrome: List[Tuple[int, bool]] = []
+            backup_buttons: List[Dict[str, Any]] = []
+
             if active_tab == "history":
-                surf_h = max(2000, curr_calc_y + 100)
-                text_surf = pygame.Surface((paper_rect.width, surf_h), pygame.SRCALPHA)
-                text_surf.fill((0, 0, 0, 0))
+                cache = body_cache["history"]
+                if cache["dirty"]:
+                    text_surf = pygame.Surface((paper_rect.width, max(2000, curr_calc_y + 100)), pygame.SRCALPHA)
+                    text_surf.fill((0, 0, 0, 0))
+                    rows: List[Dict[str, Any]] = []
 
-                curr_y = 10
-                for speaker, text, speaker_color, _ in hist_entries:
-                    spk_surf = Screen.font.render(speaker, True, speaker_color)
-                    text_surf.blit(spk_surf, (10, curr_y))
+                    if not hist_entries:
+                        empty_hint = "当前暂无对话记录。可返回主界面与墨小菊交谈，或在「分支存档」中载入历史。"
+                        eh_surf = Screen.dfont.render(empty_hint, True, MUTED_COLOR)
+                        text_surf.blit(eh_surf, ((paper_rect.width - eh_surf.get_width()) // 2, 200))
+                        cache["max_scroll"] = 0.0
+                    else:
+                        for item in hist_entries:
+                            spk_surf = Screen.font.render(item["speaker"], True, item["color"])
+                            text_surf.blit(spk_surf, (10, item["y"]))
+                            line_y = item["y"] + spk_surf.get_height() + 4
+                            for line in item["lines"]:
+                                line_surf = Screen.dfont.render(line, True, CHARCOAL_COLOR)
+                                text_surf.blit(line_surf, (10, line_y))
+                                line_y += line_surf.get_height() + 3
+                            if item["speaker"] == "墨小菊" and item["text"]:
+                                rows.append({"y": item["y"], "text": item["text"]})
+                        cache["max_scroll"] = max(0.0, curr_calc_y - paper_rect.height)
 
-                    # 墨小菊对白右侧放置语音播放与珍藏按钮
-                    if speaker == "墨小菊" and text:
-                        btn_v_rect = pygame.Rect(paper_rect.width - 70, curr_y + 2, 22, 21)
-                        btn_f_rect = pygame.Rect(paper_rect.width - 36, curr_y + 1, 24, 23)
-                        is_fav = DaisyMo.is_favorited(text)
-                        is_this_playing = (self.is_voice_playing and getattr(self, "current_playing_text", "") == text)
-                        if is_this_playing:
-                            v_icon = btn_voice_normal.copy()
-                            v_icon.fill((255, 155, 0, 255), special_flags=pygame.BLEND_RGBA_MULT)
-                            text_surf.blit(v_icon, (btn_v_rect.x, btn_v_rect.y))
-                        else:
-                            text_surf.blit(btn_voice_normal, (btn_v_rect.x, btn_v_rect.y))
-                        text_surf.blit(btn_fav_over if is_fav else btn_fav_normal, (btn_f_rect.x, btn_f_rect.y))
+                    cache["surf"] = text_surf
+                    cache["rows"] = rows
+                    cache["dirty"] = False
 
-                        # 记录相对屏幕的真实热区（外扩内衬，大幅提升连续快速点击判定容错率）
-                        v_screen_rect = pygame.Rect(paper_rect.x + btn_v_rect.x - 5, paper_rect.y + btn_v_rect.y + int(scroll_y) - 4, btn_v_rect.width + 10, btn_v_rect.height + 8)
-                        f_screen_rect = pygame.Rect(paper_rect.x + btn_f_rect.x - 4, paper_rect.y + btn_f_rect.y + int(scroll_y) - 4, btn_f_rect.width + 8, btn_f_rect.height + 8)
-                        click_actions.append((v_screen_rect, "voice", text))
-                        click_actions.append((f_screen_rect, "fav", text))
+                text_surf = cache["surf"]
+                max_scroll = cache["max_scroll"]
+                scroll_y = max(-max_scroll, min(0.0, scroll_y))
 
-                    curr_y += spk_surf.get_height() + 4
+                # 语音高亮与珍藏星标随帧变化，不进缓存
+                for row in cache["rows"]:
+                    rel_y = row["y"] + int(scroll_y)
+                    if rel_y < -80 or rel_y > paper_rect.height + 20:
+                        continue
+                    text = row["text"]
+                    rect_v = pygame.Rect(paper_rect.width - 70, row["y"] + 2, 22, 21)
+                    rect_f = pygame.Rect(paper_rect.width - 36, row["y"] + 1, 24, 23)
+                    if self.ui.is_voice_playing and getattr(self, "current_playing_text", "") == text:
+                        v_icon = btn_voice_normal.copy()
+                        v_icon.fill((255, 155, 0, 255), special_flags=pygame.BLEND_RGBA_MULT)
+                    else:
+                        v_icon = btn_voice_normal
+                    icon_blits.append((v_icon, rect_v))
+                    icon_blits.append((btn_fav_over if DaisyMo.is_favorited(text) else btn_fav_normal, rect_f))
+                    click_actions.append((_abs(rect_v.x - 5, rect_v.y - 4, rect_v.width + 10, rect_v.height + 8), "voice", text))
+                    click_actions.append((_abs(rect_f.x - 4, rect_f.y - 4, rect_f.width + 8, rect_f.height + 8), "fav", text))
 
-                    lines = self.wrap_text(Screen.dfont, text, 810)
-                    for line in lines:
-                        line_surf = Screen.dfont.render(line, True, CHARCOAL_COLOR)
-                        text_surf.blit(line_surf, (10, curr_y))
-                        curr_y += line_surf.get_height() + 3
-                    curr_y += 18
+            elif active_tab == "favorites":
+                # 珍藏分栏
+                cache = body_cache["favorites"]
+                if cache["dirty"]:
+                    fav_list = list(reversed(DaisyMo.favorites))
+                    text_surf = pygame.Surface((paper_rect.width, max(2000, len(fav_list) * 140 + 100)), pygame.SRCALPHA)
+                    text_surf.fill((0, 0, 0, 0))
+                    rows: List[Dict[str, Any]] = []
 
-                total_h = curr_y + 16
-                max_scroll = max(0.0, total_h - paper_rect.height)
+                    if not fav_list:
+                        empty_hint = "当前暂无珍藏对白，可在主界面点击名字旁边的星号加入珍藏。"
+                        eh_surf = Screen.dfont.render(empty_hint, True, MUTED_COLOR)
+                        text_surf.blit(eh_surf, ((paper_rect.width - eh_surf.get_width()) // 2, 200))
+                        cache["max_scroll"] = 0.0
+                    else:
+                        curr_y = 10
+                        for itm in fav_list:
+                            spk = itm.get("role", "墨小菊")
+                            f_text = itm.get("text", "")
+                            f_time = itm.get("time", "")
+
+                            spk_surf = Screen.font.render(spk, True, (190, 95, 0))
+                            text_surf.blit(spk_surf, (10, curr_y))
+
+                            if f_time:
+                                time_surf = Screen.dfont.render(f"[{f_time}]", True, MUTED_COLOR)
+                                text_surf.blit(time_surf, (10 + spk_surf.get_width() + 12, curr_y + 4))
+
+                            line_y = curr_y + spk_surf.get_height() + 4
+                            for line in self.wrap_text(Screen.dfont, f_text, 810):
+                                line_surf = Screen.dfont.render(line, True, CHARCOAL_COLOR)
+                                text_surf.blit(line_surf, (10, line_y))
+                                line_y += line_surf.get_height() + 3
+
+                            rows.append({"y": curr_y, "text": f_text})
+                            curr_y = line_y + 18
+                        cache["max_scroll"] = max(0.0, curr_y - paper_rect.height)
+
+                    cache["surf"] = text_surf
+                    cache["rows"] = rows
+                    cache["dirty"] = False
+
+                text_surf = cache["surf"]
+                max_scroll = cache["max_scroll"]
+                scroll_y = max(-max_scroll, min(0.0, scroll_y))
+
+                for row in cache["rows"]:
+                    rel_y = row["y"] + int(scroll_y)
+                    if rel_y < -80 or rel_y > paper_rect.height + 20:
+                        continue
+                    f_text = row["text"]
+                    rect_v = pygame.Rect(paper_rect.width - 70, row["y"] + 2, 22, 21)
+                    rect_f = pygame.Rect(paper_rect.width - 36, row["y"] + 1, 24, 23)
+                    if self.ui.is_voice_playing and getattr(self, "current_playing_text", "") == f_text:
+                        v_icon = btn_voice_normal.copy()
+                        v_icon.fill((255, 155, 0, 255), special_flags=pygame.BLEND_RGBA_MULT)
+                    else:
+                        v_icon = btn_voice_normal
+                    icon_blits.append((v_icon, rect_v))
+                    icon_blits.append((btn_fav_over, rect_f))
+                    click_actions.append((_abs(rect_v.x - 5, rect_v.y - 4, rect_v.width + 10, rect_v.height + 8), "voice", f_text))
+                    click_actions.append((_abs(rect_f.x - 4, rect_f.y - 4, rect_f.width + 8, rect_f.height + 8), "unfav", f_text))
 
             else:
-                # 珍藏分栏
-                fav_list = list(reversed(DaisyMo.favorites))
-                surf_h = max(2000, len(fav_list) * 140 + 100)
-                text_surf = pygame.Surface((paper_rect.width, surf_h), pygame.SRCALPHA)
-                text_surf.fill((0, 0, 0, 0))
+                # 分支存档分栏 (active_tab == "backups")
+                cache = body_cache["backups"]
+                if cache["dirty"]:
+                    text_surf = pygame.Surface((paper_rect.width, max(2000, len(backup_list) * 100 + 100)), pygame.SRCALPHA)
+                    text_surf.fill((0, 0, 0, 0))
+                    rows: List[Dict[str, Any]] = []
 
-                curr_y = 10
-                if not fav_list:
-                    empty_hint = "当前暂无珍藏对白，可在主界面点击名字旁边的星号加入珍藏。"
-                    eh_surf = Screen.dfont.render(empty_hint, True, MUTED_COLOR)
-                    text_surf.blit(eh_surf, ((paper_rect.width - eh_surf.get_width()) // 2, 200))
-                    total_h = 400
-                    max_scroll = 0.0
-                else:
-                    for itm in fav_list:
-                        spk = itm.get("role", "墨小菊")
-                        f_text = itm.get("text", "")
-                        f_time = itm.get("time", "")
+                    if not backup_list:
+                        empty_hint = "当前暂无分支存档。可在「历史」页点击右上角「备份当前」创建新时间线。"
+                        eh_surf = Screen.dfont.render(empty_hint, True, MUTED_COLOR)
+                        text_surf.blit(eh_surf, ((paper_rect.width - eh_surf.get_width()) // 2, 200))
+                        cache["max_scroll"] = 0.0
+                    else:
+                        card_x = 10
+                        curr_y = 12
+                        for itm in backup_list:
+                            # 只画静态文字；卡片底/边框/按钮随 hover 变化，交由每帧现画
+                            t_s = card_title_font.render(itm.get("title", ""), True, (31, 35, 43))
+                            text_surf.blit(t_s, (card_x + 14, curr_y + 12))
+                            cur_tx = card_x + 14 + t_s.get_width() + 10
 
-                        spk_surf = Screen.font.render(spk, True, (190, 95, 0))
-                        text_surf.blit(spk_surf, (10, curr_y))
+                            if itm.get("is_auto_backup"):
+                                tag_s = card_tag_font.render("[自动快照]", True, (215, 120, 10))
+                                text_surf.blit(tag_s, (cur_tx, curr_y + 16))
+                                cur_tx += tag_s.get_width() + 8
 
-                        if f_time:
-                            time_surf = Screen.dfont.render(f"[{f_time}]", True, MUTED_COLOR)
-                            text_surf.blit(time_surf, (10 + spk_surf.get_width() + 12, curr_y + 4))
+                            rnd_s = card_sub_font.render(f"{itm.get('total_rounds', 0)} 轮对话", True, (110, 115, 128))
+                            text_surf.blit(rnd_s, (cur_tx, curr_y + 15))
+                            cur_tx += rnd_s.get_width() + 12
 
-                        btn_v_rect = pygame.Rect(paper_rect.width - 70, curr_y + 2, 22, 21)
-                        btn_f_rect = pygame.Rect(paper_rect.width - 36, curr_y + 1, 24, 23)
-                        is_this_fav_playing = (self.is_voice_playing and getattr(self, "current_playing_text", "") == f_text)
-                        if is_this_fav_playing:
-                            v_icon = btn_voice_normal.copy()
-                            v_icon.fill((255, 155, 0, 255), special_flags=pygame.BLEND_RGBA_MULT)
-                            text_surf.blit(v_icon, (btn_v_rect.x, btn_v_rect.y))
-                        else:
-                            text_surf.blit(btn_voice_normal, (btn_v_rect.x, btn_v_rect.y))
-                        text_surf.blit(btn_fav_over, (btn_f_rect.x, btn_f_rect.y))
+                            time_s = card_sub_font.render(f"[{itm.get('backup_time', '')}]", True, MUTED_COLOR)
+                            text_surf.blit(time_s, (cur_tx, curr_y + 15))
 
-                        # 记录相对屏幕的真实热区（外扩内衬，大幅提升连续快速点击判定容错率）
-                        v_screen_rect = pygame.Rect(paper_rect.x + btn_v_rect.x - 5, paper_rect.y + btn_v_rect.y + int(scroll_y) - 4, btn_v_rect.width + 10, btn_v_rect.height + 8)
-                        f_screen_rect = pygame.Rect(paper_rect.x + btn_f_rect.x - 4, paper_rect.y + btn_f_rect.y + int(scroll_y) - 4, btn_f_rect.width + 8, btn_f_rect.height + 8)
-                        click_actions.append((v_screen_rect, "voice", f_text))
-                        click_actions.append((f_screen_rect, "unfav", f_text))
+                            # 对白摘要行（按可用宽度比例截断，避免与右侧按钮组重叠）
+                            preview_txt = f"{itm.get('last_speaker', '对白')}: {itm.get('last_preview', '')}"
+                            preview_max_w = 524
+                            if Screen.dfont.size(preview_txt)[0] > preview_max_w:
+                                keep = max(6, int(len(preview_txt) * preview_max_w / Screen.dfont.size(preview_txt)[0]) - 1)
+                                preview_txt = preview_txt[:keep] + "..."
+                            text_surf.blit(Screen.dfont.render(preview_txt, True, CHARCOAL_COLOR), (card_x + 14, curr_y + 45))
 
-                        curr_y += spk_surf.get_height() + 4
+                            rows.append({"y": curr_y, "itm": itm})
+                            curr_y += 94
+                        cache["max_scroll"] = max(0.0, curr_y + 16 - paper_rect.height)
 
-                        lines = self.wrap_text(Screen.dfont, f_text, 810)
-                        for line in lines:
-                            line_surf = Screen.dfont.render(line, True, CHARCOAL_COLOR)
-                            text_surf.blit(line_surf, (10, curr_y))
-                            curr_y += line_surf.get_height() + 3
-                        curr_y += 18
+                    cache["surf"] = text_surf
+                    cache["rows"] = rows
+                    cache["dirty"] = False
 
-                    total_h = curr_y
-                    max_scroll = max(0.0, total_h - paper_rect.height)
+                text_surf = cache["surf"]
+                max_scroll = cache["max_scroll"]
+                scroll_y = max(-max_scroll, min(0.0, scroll_y))
+
+                for row in cache["rows"]:
+                    rel = row["y"] + int(scroll_y)
+                    if rel < -94 or rel > paper_rect.height + 10:
+                        continue
+                    itm = row["itm"]
+                    b_id = str(itm.get("backup_id", ""))
+                    backup_chrome.append((
+                        rel,
+                        _abs(10, row["y"], 820, 82).collidepoint(mx, my) and paper_rect.collidepoint(mx, my)
+                    ))
+                    for rel_x, btn_w, act, payload in (
+                        (562, 70, "rename_backup", (b_id, str(itm.get("title", "")))),
+                        (642, 88, "load_backup", b_id),
+                        (740, 70, "delete_backup", b_id),
+                    ):
+                        btn_rect = pygame.Rect(rel_x, row["y"] + 24, btn_w, 34)
+                        backup_buttons.append({"rect": btn_rect, "kind": act})
+                        click_actions.append((_abs(btn_rect.x, btn_rect.y, btn_rect.width, btn_rect.height), act, payload))
+
+            # 记录本帧正文实际属于哪个标签。
+            # 标签点击是在下面的事件处理里改 active_tab 的，而正文已经在这之前渲染完了；
+            # 若渲染标签栏时直接用 active_tab，会出现「高亮已切、正文还是旧的那一帧」的错位闪烁。
+            drawn_tab = active_tab
 
             # 计算当前滑块坐标与热区 (滑道居中 x=1090.5, y=87~684, 行程 travel=569)
             if max_scroll > 0:
@@ -2179,7 +2483,35 @@ class Screen(object):
                 if event.type == QUIT:
                     self.exit()
                     sys_exit()
-                elif event.type == KEYDOWN:
+
+                # 模态命名弹窗优先拦截全事件
+                if input_dialog.is_open:
+                    # close() 会清空 action_context，必须在 handle_event 之前取出
+                    pending_ctx = input_dialog.action_context
+                    in_res = input_dialog.handle_event(
+                        event, mx, my, self._get_clipboard_text, self._set_clipboard_text
+                    )
+                    if in_res == "confirm" and pending_ctx:
+                        act_type, payload = pending_ctx
+                        if act_type == "rename_backup":
+                            handle_input_action("rename_backup", (payload, input_dialog.value))
+                        else:
+                            handle_input_action(act_type, input_dialog.value)
+                    if not input_dialog.is_open and self.ui.mode != PLAYER:
+                        pygame.key.stop_text_input()
+                    continue
+
+                # 模态确认弹窗次优先拦截全事件
+                if confirm_dialog.is_open:
+                    # 同上：close() 会清空 action_context，先取出再处理
+                    pending_ctx = confirm_dialog.action_context
+                    dia_res = confirm_dialog.handle_event(event, mx, my)
+                    if dia_res == "confirm" and pending_ctx:
+                        act_type, payload = pending_ctx
+                        handle_confirm_action(act_type, payload)
+                    continue
+
+                if event.type == KEYDOWN:
                     if event.key in (K_ESCAPE, K_RETURN, K_SPACE):
                         running = False
                     elif event.key == K_UP:
@@ -2190,6 +2522,13 @@ class Screen(object):
                         scroll_y = min(0.0, scroll_y + 250.0)
                     elif event.key == K_PAGEDOWN:
                         scroll_y = max(-max_scroll, scroll_y - 250.0)
+
+                elif event.type == pygame.MOUSEWHEEL:
+                    if event.y > 0:
+                        scroll_y = min(0.0, scroll_y + 50.0)
+                    elif event.y < 0:
+                        scroll_y = max(-max_scroll, scroll_y - 50.0)
+
                 elif event.type == MOUSEBUTTONDOWN:
                     if event.button == 1:
                         if rect_back.collidepoint(mx, my):
@@ -2202,6 +2541,46 @@ class Screen(object):
                             active_tab = "favorites"
                             scroll_y = 0.0
                             is_dragging_slider = False
+                        elif rect_tab_backup.collidepoint(mx, my):
+                            active_tab = "backups"
+                            scroll_y = 0.0
+                            is_dragging_slider = False
+
+                        elif drawn_tab == "history" and rect_btn_backup.collidepoint(mx, my):
+                            if not self.conversation:
+                                self.show_toast("当前暂无对话记录可备份")
+                            else:
+                                open_input_dialog(
+                                    title="创建分支存档",
+                                    label="为这段回忆起一个名字",
+                                    default_text=history_mgr.default_backup_title(),
+                                    context=("new_backup", None)
+                                )
+
+                        elif drawn_tab == "history" and rect_btn_clear.collidepoint(mx, my):
+                            if not self.conversation:
+                                self.show_toast("当前对话记录已是空白")
+                            else:
+                                confirm_dialog.open(
+                                    title="重置当前对话",
+                                    sub1="确定要清空与墨小菊的全部当前对话吗？",
+                                    sub2="系统将自动为你生成一份安全快照，随时可在分支存档中恢复。",
+                                    confirm_text="确认清空",
+                                    cancel_text="保留回忆",
+                                    context=("clear", None)
+                                )
+
+                        elif drawn_tab == "backups" and rect_btn_new_backup.collidepoint(mx, my):
+                            if not self.conversation:
+                                self.show_toast("当前暂无对话记录可备份")
+                            else:
+                                open_input_dialog(
+                                    title="新建分支存档",
+                                    label="为这段回忆起一个名字",
+                                    default_text=history_mgr.default_backup_title(),
+                                    context=("new_backup", None)
+                                )
+
                         elif rect_slider.collidepoint(mx, my):
                             is_dragging_slider = True
                         elif rect_track.collidepoint(mx, my):
@@ -2217,10 +2596,41 @@ class Screen(object):
                                     elif act_type in ("fav", "unfav"):
                                         now_is_fav = DaisyMo.toggle_favorite(content)
                                         self.show_toast("已加入珍藏" if now_is_fav else "已移出珍藏")
+                                        mark_dirty("history", "favorites")
+                                    elif act_type == "rename_backup":
+                                        b_id, b_title = content
+                                        open_input_dialog(
+                                            title="重命名分支存档",
+                                            label="修改这条时间线的名称",
+                                            default_text=str(b_title),
+                                            context=("rename_backup", str(b_id))
+                                        )
+                                    elif act_type == "load_backup":
+                                        b_id = str(content)
+                                        b_title = next((b["title"] for b in backup_list if b["backup_id"] == b_id), "此分支")
+                                        confirm_dialog.open(
+                                            title="载入时间线分支",
+                                            sub1=f"确定载入「{b_title}」吗？",
+                                            sub2="当前对话将自动快照归档，随后切换至该时间线。",
+                                            confirm_text="确认载入",
+                                            cancel_text="取消",
+                                            context=("load_backup", b_id)
+                                        )
+                                    elif act_type == "delete_backup":
+                                        b_id = str(content)
+                                        b_title = next((b["title"] for b in backup_list if b["backup_id"] == b_id), "此分支")
+                                        confirm_dialog.open(
+                                            title="删除分支存档",
+                                            sub1=f"确定删除「{b_title}」吗？",
+                                            sub2="存档将被移入 .trash 回收目录，可从本地存储中找回。",
+                                            confirm_text="确认删除",
+                                            cancel_text="取消",
+                                            context=("delete_backup", b_id)
+                                        )
                                     break
-                    elif event.button == 4:   # 滚轮向上
+                    elif event.button == 4:   # 传统滚轮向上
                         scroll_y = min(0.0, scroll_y + 50.0)
-                    elif event.button == 5:   # 滚轮向下
+                    elif event.button == 5:   # 传统滚轮向下
                         scroll_y = max(-max_scroll, scroll_y - 50.0)
 
                 elif event.type == MOUSEMOTION:
@@ -2235,16 +2645,16 @@ class Screen(object):
             # 绘制底图
             self.screen.blit(bg_backlog, (0, 0))
 
-            # 绘制顶部双标签栏 (方案C：契合《三色绘恋》信纸素描质感，日系刻印水墨文字与琥珀橙下划线，绝无 Emoji)
+            # 绘制顶部三标签栏 (信纸素描和纸刻印风格)
             tabs = [
-                (rect_tab_hist, "历史", active_tab == "history"),
-                (rect_tab_fav, f"珍藏 ({len(DaisyMo.favorites)})", active_tab == "favorites")
+                (rect_tab_hist, "历史", drawn_tab == "history"),
+                (rect_tab_fav, f"珍藏 ({len(DaisyMo.favorites)})", drawn_tab == "favorites"),
+                (rect_tab_backup, f"分支存档 ({len(backup_list)})", drawn_tab == "backups")
             ]
             for r_tab, txt, is_act in tabs:
                 is_hover = r_tab.collidepoint(mx, my)
                 if is_act:
                     txt_color = (215, 120, 10)  # 小菊琥珀橙
-                    # 精致 2px 下划线
                     pygame.draw.line(self.screen, (255, 155, 0), (r_tab.x + 8, r_tab.bottom - 3), (r_tab.right - 8, r_tab.bottom - 3), 2)
                 elif is_hover:
                     txt_color = (45, 50, 60)    # 悬停深炭黑
@@ -2255,9 +2665,70 @@ class Screen(object):
                 txt_surf = Screen.card_font.render(txt, True, txt_color)
                 self.screen.blit(txt_surf, (r_tab.x + (r_tab.width - txt_surf.get_width()) // 2, r_tab.y + (r_tab.height - txt_surf.get_height()) // 2))
 
-            # 视口裁剪渲染正文
+            # 绘制顶部右侧操作按钮（跟随正文实际所属的标签，避免与正文错位一帧）
+            if drawn_tab == "history":
+                # 1. 备份当前回忆按钮
+                is_b_hover = rect_btn_backup.collidepoint(mx, my)
+                pygame.draw.rect(self.screen, (255, 246, 232) if is_b_hover else (255, 255, 255, 210), rect_btn_backup, border_radius=5)
+                pygame.draw.rect(self.screen, (255, 155, 0) if is_b_hover else (210, 204, 194), rect_btn_backup, width=1, border_radius=5)
+                b_txt = dia_btn_font.render("备份当前", True, (215, 120, 10) if is_b_hover else (75, 80, 92))
+                self.screen.blit(b_txt, (rect_btn_backup.x + (rect_btn_backup.width - b_txt.get_width()) // 2, rect_btn_backup.y + (rect_btn_backup.height - b_txt.get_height()) // 2))
+
+                # 2. 清空记录按钮
+                is_c_hover = rect_btn_clear.collidepoint(mx, my)
+                pygame.draw.rect(self.screen, (255, 236, 236) if is_c_hover else (255, 255, 255, 210), rect_btn_clear, border_radius=5)
+                pygame.draw.rect(self.screen, (225, 90, 90) if is_c_hover else (210, 204, 194), rect_btn_clear, width=1, border_radius=5)
+                c_txt = dia_btn_font.render("清空记录", True, (190, 50, 50) if is_c_hover else (120, 95, 95))
+                self.screen.blit(c_txt, (rect_btn_clear.x + (rect_btn_clear.width - c_txt.get_width()) // 2, rect_btn_clear.y + (rect_btn_clear.height - c_txt.get_height()) // 2))
+
+            elif drawn_tab == "backups":
+                # 新建备份按钮
+                is_nb_hover = rect_btn_new_backup.collidepoint(mx, my)
+                pygame.draw.rect(self.screen, (255, 246, 232) if is_nb_hover else (255, 255, 255, 210), rect_btn_new_backup, border_radius=5)
+                pygame.draw.rect(self.screen, (255, 155, 0) if is_nb_hover else (210, 204, 194), rect_btn_new_backup, width=1, border_radius=5)
+                nb_txt = dia_btn_font.render("新建备份", True, (215, 120, 10) if is_nb_hover else (75, 80, 92))
+                self.screen.blit(nb_txt, (rect_btn_new_backup.x + (rect_btn_new_backup.width - nb_txt.get_width()) // 2, rect_btn_new_backup.y + (rect_btn_new_backup.height - nb_txt.get_height()) // 2))
+
+            # ---- 正文绘制：唯一一次正文 blit（内容已缓存，滚动只改裁剪区）----
+            prev_clip = self.screen.get_clip()
+            self.screen.set_clip(paper_rect)
+
+            # 分支存档的卡片底与边框随 hover 变化，必须垫在缓存正文之下
+            for rel, hovered in backup_chrome:
+                cy = paper_rect.y + rel
+                pygame.draw.rect(self.screen, (255, 252, 246) if hovered else (248, 245, 239),
+                                 (paper_rect.x + 10, cy, 820, 82), border_radius=8)
+                pygame.draw.rect(self.screen, (255, 155, 0, 160) if hovered else (218, 212, 202, 180),
+                                 (paper_rect.x + 10, cy, 820, 82), width=1, border_radius=8)
+
             clip_rect = pygame.Rect(0, int(-scroll_y), paper_rect.width, paper_rect.height)
             self.screen.blit(text_surf, (paper_rect.x, paper_rect.y), area=clip_rect)
+
+            # 每帧现画的动效层：语音高亮、珍藏星标（画在缓存正文之上）
+            for icon_surf, icon_rect in icon_blits:
+                self.screen.blit(icon_surf, (paper_rect.x + icon_rect.x, paper_rect.y + icon_rect.y + int(scroll_y)))
+
+            # 分支存档的三个按钮（hover 态每帧重算）
+            for btn in backup_buttons:
+                r = btn["rect"]
+                sr = pygame.Rect(paper_rect.x + r.x, paper_rect.y + r.y + int(scroll_y), r.width, r.height)
+                hovered = sr.collidepoint(mx, my) and paper_rect.collidepoint(mx, my)
+                kind = btn["kind"]
+                if kind == "rename_backup":
+                    pygame.draw.rect(self.screen, (255, 246, 232) if hovered else (240, 236, 229), sr, border_radius=6)
+                    pygame.draw.rect(self.screen, (255, 155, 0) if hovered else (206, 199, 188), sr, width=1, border_radius=6)
+                    label, txt_color = "改名", ((215, 120, 10) if hovered else (75, 80, 92))
+                elif kind == "load_backup":
+                    pygame.draw.rect(self.screen, (255, 155, 0) if hovered else (215, 120, 10), sr, border_radius=6)
+                    label, txt_color = "载入分支", (255, 255, 255)
+                else:
+                    pygame.draw.rect(self.screen, (246, 226, 226) if hovered else (234, 230, 224), sr, border_radius=6)
+                    label, txt_color = "删除", ((190, 50, 50) if hovered else (90, 95, 105))
+                lbl = dia_btn_font.render(label, True, txt_color)
+                self.screen.blit(lbl, (sr.x + (sr.width - lbl.get_width()) // 2,
+                                       sr.y + (sr.height - lbl.get_height()) // 2))
+
+            self.screen.set_clip(prev_clip)
 
             # 绘制右侧滑道中的官方原生圆纽扣滑块 (assets/ui/backlog_slider.png)
             self.screen.blit(btn_slider, (slider_x, int(slider_y)))
@@ -2266,19 +2737,37 @@ class Screen(object):
             back_btn = btn_back_over if rect_back.collidepoint(mx, my) else btn_back_normal
             self.screen.blit(back_btn, (rect_back.x, rect_back.y))
 
+            # 二次确认模态弹窗
+            if confirm_dialog.is_open:
+                confirm_dialog.render(self.screen, mx, my)
+
+            # 命名输入模态弹窗
+            if input_dialog.is_open:
+                input_dialog.render(self.screen, mx, my)
+
             # 浮动提示 Toast
-            if self.toast_text and (time() - self.toast_time < 2.0):
-                t_surf = Screen.card_font.render(self.toast_text, True, GOLD_COLOR)
+            if self.ui.toast_text and (time() - self.ui.toast_time < 2.0):
+                t_surf = Screen.card_font.render(self.ui.toast_text, True, GOLD_COLOR)
                 tw, th = t_surf.get_size()
                 tx = (1280 - tw) // 2
                 ty = 510
                 pygame.draw.rect(self.screen, (20, 24, 32), (tx - 16, ty - 6, tw + 32, th + 12), border_radius=6)
                 pygame.draw.rect(self.screen, DCOLOR, (tx - 16, ty - 6, tw + 32, th + 12), width=1, border_radius=6)
                 self.screen.blit(t_surf, (tx, ty))
-            elif self.toast_text and (time() - self.toast_time >= 2.0):
-                self.toast_text = ""
+            elif self.ui.toast_text and (time() - self.ui.toast_time >= 2.0):
+                self.ui.toast_text = ""
 
             pygame.display.flip()
+
+        # 退出回忆界面时按当前发言模式还原输入法状态，避免残留中文输入法候选窗
+        if input_dialog.is_open:
+            input_dialog.close()
+        if self.ui.mode == PLAYER:
+            pygame.key.start_text_input()
+        else:
+            pygame.key.stop_text_input()
+
+        return hist_dirty
 
     def system_menu(self) -> str:
         """极简 AI 核心设置面板 (采用声明式自绘控件库 daisymo_widgets 驱动，支持双分栏与动效无损保全)"""
@@ -2512,8 +3001,8 @@ class Screen(object):
                     Mixer.set_volume(slider_bgm.value)
                 if slider_voice.handle_event(event, mx, my):
                     DaisyMo.voice_volume = slider_voice.value
-                    if self.voice_channel:
-                        self.voice_channel.set_volume(slider_voice.value)
+                    if self.ui.voice_channel:
+                        self.ui.voice_channel.set_volume(slider_voice.value)
 
                 # 输入框事件派发
                 for b in current_boxes:
@@ -2542,8 +3031,8 @@ class Screen(object):
                         do_save_config()
                         if hasattr(self, 'daisymo') and self.daisymo:
                             self.daisymo.save()
-                        if self.voice_channel:
-                            self.voice_channel.fadeout(200)
+                        if self.ui.voice_channel:
+                            self.ui.voice_channel.fadeout(200)
                         pygame.key.set_repeat(0)
                         pygame.key.stop_text_input()
 
@@ -2596,12 +3085,12 @@ class Screen(object):
                         Mixer.set_volume(slider_bgm.value)
                     elif rect_vvol_down.collidepoint(mx, my):
                         DaisyMo.voice_volume = slider_voice.step_down()
-                        if self.voice_channel:
-                            self.voice_channel.set_volume(slider_voice.value)
+                        if self.ui.voice_channel:
+                            self.ui.voice_channel.set_volume(slider_voice.value)
                     elif rect_vvol_up.collidepoint(mx, my):
                         DaisyMo.voice_volume = slider_voice.step_up()
-                        if self.voice_channel:
-                            self.voice_channel.set_volume(slider_voice.value)
+                        if self.ui.voice_channel:
+                            self.ui.voice_channel.set_volume(slider_voice.value)
 
                     # LLM 专有按钮
                     if active_system_tab == "llm":
@@ -2774,10 +3263,10 @@ class Screen(object):
                                     )
                                     if ok:
                                         snd = pygame.mixer.Sound(tmp_audio)
-                                        if not self.voice_channel:
-                                            self.voice_channel = pygame.mixer.Channel(1)
-                                        self.voice_channel.set_volume(slider_voice.value)
-                                        self.voice_channel.play(snd)
+                                        if not self.ui.voice_channel:
+                                            self.ui.voice_channel = pygame.mixer.Channel(1)
+                                        self.ui.voice_channel.set_volume(slider_voice.value)
+                                        self.ui.voice_channel.play(snd)
                                         tts_status_text = "发音测试成功"
                                         tts_status_color = (120, 230, 160)
                                     else:
@@ -3082,7 +3571,7 @@ class Screen(object):
             pygame.display.flip()
 
         pygame.key.set_repeat(0)
-        if self.mode == PLAYER:
+        if self.ui.mode == PLAYER:
             pygame.key.start_text_input()
         else:
             pygame.key.stop_text_input()

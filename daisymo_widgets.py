@@ -7,6 +7,9 @@ DaisyMo Pygame 声明式自绘控件库 (Pygame Declarative UI Widgets Engine)
 3. SliderBar: 平滑自绘滑块组件（支持点击、拖拽、步进调节）
 4. DropdownMenu: 浮层下拉列表组件（支持气泡高亮、点击外部自动关闭、滚轮浏览）
 5. TabGroup: 选项卡分组组件
+6. DialogueScrollBar: 对白垂直滚动条
+7. ConfirmDialog: 和风模态二次确认弹窗
+8. InputDialog: 和风模态文本输入弹窗（内置单行文本域与空值校验）
 """
 
 import time
@@ -17,6 +20,7 @@ from pygame.locals import (
     K_a, K_c, K_v, K_x,
     K_BACKSPACE, K_DELETE,
     K_LEFT, K_RIGHT, K_HOME, K_END,
+    K_RETURN, K_KP_ENTER, K_ESCAPE, K_TAB,
     KMOD_CTRL, KMOD_SHIFT,
     KEYDOWN, KEYUP,
     MOUSEBUTTONDOWN, MOUSEBUTTONUP, MOUSEMOTION,
@@ -148,8 +152,12 @@ class TextInputBox:
     def insert_text(self, new_chars: str) -> bool:
         if not new_chars:
             return False
-        if self.max_length and len(self._text) + len(new_chars) > self.max_length:
-            new_chars = new_chars[:max(0, self.max_length - len(self._text))]
+        # 选区会被本次输入整体替换，先扣除其长度再判断上限，
+        # 否则「全选后直接输入」会被 max_length 误截断（实际长度并未超限）。
+        sel_len = abs(self.sel_end - self.sel_start)
+        effective_len = len(self._text) - sel_len
+        if self.max_length and effective_len + len(new_chars) > self.max_length:
+            new_chars = new_chars[:max(0, self.max_length - effective_len)]
             if not new_chars:
                 return False
 
@@ -943,3 +951,497 @@ class DialogueScrollBar:
 
     # 规范别名
     draw = render
+
+
+class ModalShell:
+    """
+    和风模态弹窗的外壳：暗场遮罩 + 投影 + 和纸卡片 + 按钮对 + 模态拦截。
+
+    ConfirmDialog 与 InputDialog 以前各自把这套外壳画了一遍（约 28–30 行逐字重复）。
+    现在下沉到这里：外壳只负责「框」和「按钮」，弹窗内容区由调用方各自填。
+
+    外壳承担（凡跟这两个弹窗长得一样的部分）：
+    - render_frame(surface)：暗场 + 投影 + 卡片 + 标题 + 取消/确认按钮
+    - rect_cancel / rect_confirm：按钮热区几何
+    - is_open / open / close：开关状态与 action_context
+    - modal_block(event)：是否该把事件拦在弹窗内（滚轮、鼠标）
+
+    它不关心内容区（ConfirmDialog 的两行说明、InputDialog 的输入框）长什么样。
+    """
+
+    def __init__(
+        self,
+        title: str = "",
+        confirm_text: str = "确认",
+        cancel_text: str = "取消",
+        width: int = 460,
+        height: int = 210,
+        screen_size: Tuple[int, int] = (1280, 720)
+    ) -> None:
+        self.title: str = title
+        self.confirm_text: str = confirm_text
+        self.cancel_text: str = cancel_text
+        self.width: int = width
+        self.height: int = height
+        self.screen_size: Tuple[int, int] = screen_size
+
+        self._is_open: bool = False
+        self.action_context: Any = None
+
+        self._update_geometry()
+
+    def _update_geometry(self) -> None:
+        sw, sh = self.screen_size
+        self.x = (sw - self.width) // 2
+        self.y = (sh - self.height) // 2
+        btn_w, btn_h = 140, 36
+        btn_y = self.y + self.height - btn_h - 22
+        self.rect_cancel = pygame.Rect(self.x + 55, btn_y, btn_w, btn_h)
+        self.rect_confirm = pygame.Rect(self.x + self.width - btn_w - 55, btn_y, btn_w, btn_h)
+
+    @property
+    def is_open(self) -> bool:
+        return self._is_open
+
+    def open(self) -> None:
+        self._is_open = True
+
+    def close(self) -> None:
+        self._is_open = False
+        self.action_context = None
+
+    def modal_block(self, event: pygame.event.Event) -> bool:
+        """打开时滚轮与鼠标事件是否要拦在弹窗内（不往下穿透）"""
+        return event.type in (pygame.MOUSEWHEEL, pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP)
+
+    def render_frame(
+        self,
+        surface: pygame.Surface,
+        mx: int,
+        my: int,
+        title_font: Optional[pygame.font.Font] = None,
+        btn_font: Optional[pygame.font.Font] = None
+    ) -> None:
+        """画遮罩、投影、卡片、标题、按钮对（不含内容区）"""
+        sw, sh = self.screen_size
+
+        # 1. 暗场遮罩
+        dark_mask = pygame.Surface((sw, sh), pygame.SRCALPHA)
+        dark_mask.fill((0, 0, 0, 195))
+        surface.blit(dark_mask, (0, 0))
+
+        # 2. 投影
+        dia_shadow = pygame.Surface((self.width + 24, self.height + 24), pygame.SRCALPHA)
+        pygame.draw.rect(dia_shadow, (0, 0, 0, 120), (12, 12, self.width, self.height), border_radius=12)
+        surface.blit(dia_shadow, (self.x - 12, self.y - 12))
+
+        # 3. 和纸主卡片
+        dia_card = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
+        pygame.draw.rect(dia_card, (250, 248, 245), (0, 0, self.width, self.height), border_radius=12)
+        pygame.draw.rect(dia_card, (215, 120, 10, 60), (0, 0, self.width, self.height), width=1, border_radius=12)
+        surface.blit(dia_card, (self.x, self.y))
+
+        # 4. 标题
+        t_font = title_font or pygame.font.Font(None, 24)
+        dt_s = t_font.render(self.title, True, (31, 35, 43))
+        surface.blit(dt_s, (self.x + (self.width - dt_s.get_width()) // 2, self.y + 26))
+
+        b_font = btn_font or pygame.font.Font(None, 18)
+
+        # 5. 取消按钮
+        is_can_hover = self.rect_cancel.collidepoint(mx, my)
+        pygame.draw.rect(surface, (226, 221, 211) if is_can_hover else (237, 232, 223), self.rect_cancel, border_radius=6)
+        pygame.draw.rect(surface, (190, 180, 165) if is_can_hover else (208, 200, 184), self.rect_cancel, width=1, border_radius=6)
+        bc_txt = b_font.render(self.cancel_text, True, (31, 35, 43) if is_can_hover else (45, 50, 62))
+        surface.blit(bc_txt, (self.rect_cancel.x + (self.rect_cancel.width - bc_txt.get_width()) // 2, self.rect_cancel.y + (self.rect_cancel.height - bc_txt.get_height()) // 2))
+
+        # 6. 确认按钮
+        is_conf_hover = self.rect_confirm.collidepoint(mx, my)
+        pygame.draw.rect(surface, (255, 155, 0) if is_conf_hover else (215, 120, 10), self.rect_confirm, border_radius=6)
+        pygame.draw.rect(surface, (255, 200, 100) if is_conf_hover else (255, 155, 0), self.rect_confirm, width=1, border_radius=6)
+        bcf_txt = b_font.render(self.confirm_text, True, (255, 255, 255))
+        surface.blit(bcf_txt, (self.rect_confirm.x + (self.rect_confirm.width - bcf_txt.get_width()) // 2, self.rect_confirm.y + (self.rect_confirm.height - bcf_txt.get_height()) // 2))
+
+
+class ConfirmDialog:
+    """
+    和风通用模态二次确认弹窗控件
+    - 模态遮罩 (半透明背景) + 和纸风圆角投影卡片
+    - 支持自定义标题、主说明、次说明、确认按键与取消按键文案
+    - 模态事件严格拦截：打开时下层任何控件与事件不可穿透
+    - 键盘交互支持：Enter 确认，Esc 取消
+    - 返回 'confirm' | 'cancel' | 'block' | None
+    """
+
+    def __init__(
+        self,
+        title: str = "确认操作",
+        sub1: str = "请确认是否继续此操作？",
+        sub2: str = "",
+        confirm_text: str = "确认",
+        cancel_text: str = "取消",
+        width: int = 460,
+        height: int = 210,
+        screen_size: Tuple[int, int] = (1280, 720),
+        title_font: Optional[pygame.font.Font] = None,
+        sub_font: Optional[pygame.font.Font] = None,
+        sub2_font: Optional[pygame.font.Font] = None,
+        btn_font: Optional[pygame.font.Font] = None
+    ) -> None:
+        self.sub1: str = sub1
+        self.sub2: str = sub2
+        self.screen_size: Tuple[int, int] = screen_size
+
+        self.title_font = title_font
+        self.sub_font = sub_font
+        self.sub2_font = sub2_font
+        self.btn_font = btn_font
+
+        # 外壳：遮罩/投影/卡片/标题/按钮对/模态拦截，全部下沉
+        self.shell: ModalShell = ModalShell(
+            title=title,
+            confirm_text=confirm_text,
+            cancel_text=cancel_text,
+            width=width,
+            height=height,
+            screen_size=screen_size
+        )
+
+    # ---- 转发给外壳，保持原有调用方无感 ----
+    @property
+    def is_open(self) -> bool:
+        return self.shell.is_open
+
+    @property
+    def action_context(self) -> Any:
+        return self.shell.action_context
+
+    @action_context.setter
+    def action_context(self, val: Any) -> None:
+        self.shell.action_context = val
+
+    @property
+    def rect_cancel(self) -> pygame.Rect:
+        return self.shell.rect_cancel
+
+    @property
+    def rect_confirm(self) -> pygame.Rect:
+        return self.shell.rect_confirm
+
+    def open(
+        self,
+        title: Optional[str] = None,
+        sub1: Optional[str] = None,
+        sub2: Optional[str] = None,
+        confirm_text: Optional[str] = None,
+        cancel_text: Optional[str] = None,
+        context: Any = None
+    ) -> None:
+        if title is not None:
+            self.shell.title = title
+        if sub1 is not None:
+            self.sub1 = sub1
+        if sub2 is not None:
+            self.sub2 = sub2
+        if confirm_text is not None:
+            self.shell.confirm_text = confirm_text
+        if cancel_text is not None:
+            self.shell.cancel_text = cancel_text
+        self.shell.action_context = context
+        self.shell.open()
+
+    def close(self) -> None:
+        self.shell.close()
+
+    def handle_event(
+        self,
+        event: pygame.event.Event,
+        mx: Optional[int] = None,
+        my: Optional[int] = None
+    ) -> Optional[str]:
+        if not self.shell.is_open:
+            return None
+
+        if mx is None or my is None:
+            mx, my = pygame.mouse.get_pos()
+
+        # 键盘快捷键
+        if event.type == pygame.KEYDOWN:
+            if event.key in (pygame.K_RETURN, pygame.K_SPACE):
+                self.close()
+                return "confirm"
+            elif event.key == pygame.K_ESCAPE:
+                self.close()
+                return "cancel"
+
+        # 鼠标点击
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if self.shell.rect_confirm.collidepoint(mx, my):
+                self.close()
+                return "confirm"
+            elif self.shell.rect_cancel.collidepoint(mx, my):
+                self.close()
+                return "cancel"
+            return "block"
+
+        # 滚轮与点击全面阻断，杜绝穿透
+        if self.shell.modal_block(event):
+            return "block"
+
+        return None
+
+    def render(self, surface: pygame.Surface, mx: Optional[int] = None, my: Optional[int] = None) -> None:
+        if not self.shell.is_open:
+            return
+
+        if mx is None or my is None:
+            mx, my = pygame.mouse.get_pos()
+
+        # 外壳：遮罩 + 投影 + 卡片 + 标题 + 按钮
+        self.shell.render_frame(surface, mx, my, self.title_font, self.btn_font)
+
+        # 内容区：两行说明
+        s_font = self.sub_font or pygame.font.Font(None, 18)
+        s2_font = self.sub2_font or pygame.font.Font(None, 16)
+
+        if self.sub1:
+            ds1 = s_font.render(self.sub1, True, (92, 98, 112))
+            surface.blit(ds1, (self.shell.x + (self.shell.width - ds1.get_width()) // 2, self.shell.y + 68))
+
+        if self.sub2:
+            ds2 = s2_font.render(self.sub2, True, (118, 124, 138))
+            surface.blit(ds2, (self.shell.x + (self.shell.width - ds2.get_width()) // 2, self.shell.y + 94))
+
+    draw = render
+
+
+class InputDialog:
+    """
+    和风通用模态文本输入弹窗控件
+
+    - 复用 ConfirmDialog 的和纸卡片、投影、暗场遮罩与模态拦截几何
+    - 内嵌一个 TextInputBox 单行文本域，支持中文输入法（TEXTINPUT）、选区、剪贴板
+    - 键盘交互：Enter 确认，Esc 取消，Tab 切换文本域焦点
+    - 空值校验：规整后为空时拒绝确认，并在提示行红字说明
+    - 返回 'confirm' | 'cancel' | 'block' | None
+    """
+
+    def __init__(
+        self,
+        title: str = "重命名",
+        label: str = "",
+        confirm_text: str = "确认",
+        cancel_text: str = "取消",
+        placeholder: str = "",
+        max_length: Optional[int] = 24,
+        width: int = 520,
+        height: int = 250,
+        screen_size: Tuple[int, int] = (1280, 720),
+        title_font: Optional[pygame.font.Font] = None,
+        label_font: Optional[pygame.font.Font] = None,
+        hint_font: Optional[pygame.font.Font] = None,
+        btn_font: Optional[pygame.font.Font] = None,
+        input_font: Optional[pygame.font.Font] = None
+    ) -> None:
+        self.label: str = label
+        self.screen_size: Tuple[int, int] = screen_size
+        self.max_length: Optional[int] = max_length
+        self.error_text: str = ""
+
+        self.title_font = title_font
+        self.label_font = label_font
+        self.hint_font = hint_font
+        self.btn_font = btn_font
+        # 文本域必须持有可用字体，否则 TextInputBox.render 会提前返回导致完全看不到文字
+        self.input_font = input_font or pygame.font.Font(None, 20)
+
+        self._blink: BlinkCursor = BlinkCursor(0.5)
+
+        # 外壳：遮罩/投影/卡片/标题/按钮对/模态拦截，全部下沉
+        self.shell: ModalShell = ModalShell(
+            title=title,
+            confirm_text=confirm_text,
+            cancel_text=cancel_text,
+            width=width,
+            height=height,
+            screen_size=screen_size
+        )
+
+        self._update_geometry()
+        self.box: TextInputBox = TextInputBox(
+            rect=self.rect_input,
+            text="",
+            font=self.input_font,
+            placeholder=placeholder,
+            max_length=max_length,
+            border_radius=6,
+            bg_color=(255, 253, 250),
+            border_color=(214, 206, 193),
+            active_border_color=(255, 155, 0),
+            text_color=(31, 35, 43),
+            placeholder_color=(163, 163, 163),
+            sel_color=(255, 200, 120),
+            cursor_color=(215, 120, 10),
+            max_lines=1
+        )
+
+    def _update_geometry(self) -> None:
+        self.x = self.shell.x
+        self.y = self.shell.y
+        self.width = self.shell.width
+        self.height = self.shell.height
+
+        pad = 40
+        self.rect_input = pygame.Rect(self.x + pad, self.y + 96, self.width - pad * 2, 42)
+        self.hint_y = self.y + 152
+
+    # ---- 转发给外壳，保持原有调用方无感 ----
+    @property
+    def is_open(self) -> bool:
+        return self.shell.is_open
+
+    @property
+    def action_context(self) -> Any:
+        return self.shell.action_context
+
+    @action_context.setter
+    def action_context(self, val: Any) -> None:
+        self.shell.action_context = val
+
+    @property
+    def rect_cancel(self) -> pygame.Rect:
+        return self.shell.rect_cancel
+
+    @property
+    def rect_confirm(self) -> pygame.Rect:
+        return self.shell.rect_confirm
+
+    @property
+    def value(self) -> str:
+        """规整后的当前输入值（压缩空白、去首尾）"""
+        return " ".join(self.box.text.split()).strip()
+
+    def open(
+        self,
+        title: Optional[str] = None,
+        label: Optional[str] = None,
+        default_text: str = "",
+        confirm_text: Optional[str] = None,
+        cancel_text: Optional[str] = None,
+        context: Any = None
+    ) -> None:
+        if title is not None:
+            self.shell.title = title
+        if label is not None:
+            self.label = label
+        if confirm_text is not None:
+            self.shell.confirm_text = confirm_text
+        if cancel_text is not None:
+            self.shell.cancel_text = cancel_text
+
+        self.box.text = default_text or ""
+        self.box.is_active = True
+        self.box.select_all()
+        self.box.is_dragging = False
+        self._blink.reset()
+        self.error_text = ""
+        self.shell.action_context = context
+        self.shell.open()
+
+    def close(self) -> None:
+        self.shell.close()
+        self.box.is_active = False
+        self.box.is_dragging = False
+        self.error_text = ""
+
+    def handle_event(
+        self,
+        event: pygame.event.Event,
+        mx: Optional[int] = None,
+        my: Optional[int] = None,
+        clipboard_getter: Optional[Callable[[], str]] = None,
+        clipboard_setter: Optional[Callable[[str], None]] = None
+    ) -> Optional[str]:
+        if not self.shell.is_open:
+            return None
+
+        if mx is None or my is None:
+            mx, my = pygame.mouse.get_pos()
+
+        if event.type == KEYDOWN:
+            if event.key == K_ESCAPE:
+                self.close()
+                return "cancel"
+            if event.key in (K_RETURN, K_KP_ENTER):
+                if not self.value:
+                    self.error_text = "名称不能为空"
+                    return "block"
+                self.close()
+                return "confirm"
+            if event.key == K_TAB:
+                self.box.is_active = True
+                self._blink.reset()
+                return "block"
+
+        if event.type == MOUSEBUTTONDOWN and event.button == 1:
+            if self.shell.rect_confirm.collidepoint(mx, my):
+                if not self.value:
+                    self.error_text = "名称不能为空"
+                    return "block"
+                self.close()
+                return "confirm"
+            if self.shell.rect_cancel.collidepoint(mx, my):
+                self.close()
+                return "cancel"
+            if self.rect_input.collidepoint(mx, my):
+                self.error_text = ""
+                self.box.handle_event(event, mx, my, clipboard_getter, clipboard_setter)
+                self._blink.reset()
+                return "block"
+            return "block"
+
+        # 文本域自身的键盘 / 滚轮 / 拖选交互
+        changed = self.box.handle_event(event, mx, my, clipboard_getter, clipboard_setter)
+        if changed:
+            self.error_text = ""
+            self._blink.reset()
+
+        if self.shell.modal_block(event) or event.type == MOUSEMOTION:
+            return "block"
+        return None
+
+    def render(self, surface: pygame.Surface, mx: Optional[int] = None, my: Optional[int] = None) -> None:
+        if not self.shell.is_open:
+            return
+
+        if mx is None or my is None:
+            mx, my = pygame.mouse.get_pos()
+
+        # 外壳：遮罩 + 投影 + 卡片 + 标题 + 按钮
+        self.shell.render_frame(surface, mx, my, self.title_font, self.btn_font)
+
+        l_font = self.label_font or pygame.font.Font(None, 18)
+        h_font = self.hint_font or pygame.font.Font(None, 16)
+
+        # 内容区：标签行 + 字数计数
+        if self.label:
+            lb_s = l_font.render(self.label, True, (92, 98, 112))
+            surface.blit(lb_s, (self.shell.x + 40, self.shell.y + 70))
+
+        if self.max_length:
+            cnt_s = h_font.render(f"{len(self.box.text)}/{self.max_length}", True, (150, 154, 164))
+            surface.blit(cnt_s, (self.shell.x + self.shell.width - 40 - cnt_s.get_width(), self.shell.y + 72))
+
+        # 文本域
+        self.box.render(surface, self._blink.tick())
+
+        # 提示 / 校验行
+        if self.error_text:
+            er_s = h_font.render(self.error_text, True, (190, 50, 50))
+            surface.blit(er_s, (self.shell.x + 40, self.hint_y))
+        else:
+            ph_s = h_font.render("输入完成后按 Enter 确认，按 Esc 取消", True, (140, 147, 164))
+            surface.blit(ph_s, (self.shell.x + 40, self.hint_y))
+
+    draw = render
+

@@ -17,6 +17,7 @@ Apikey.txt
 # ==============================================================================
 assets/DaisyMo_history.json
 assets/favorites.json
+assets/history_backups/
 assets/temp_tts.wav
 assets/tts_cache/
 assets/*.tmp
@@ -46,6 +47,7 @@ dist/
 .claude/
 .idea/
 .vscode/
+.workbuddy/
 *.swp
 *.swo
 .DS_Store
@@ -78,3 +80,6 @@ direction-approved.md
 preview_thinking_*.png
 verified_*.png
 hero_icon_*.png
+
+# 离屏界面预览图（开发产物，不入库；每次测试重出）
+preview_*.png

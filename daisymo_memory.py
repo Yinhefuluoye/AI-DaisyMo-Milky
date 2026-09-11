@@ -43,14 +43,22 @@ class ScenarioMemoryRetriever:
         return cls._instance
 
     def _load_database(self, json_path: Optional[str] = None) -> None:
-        """从 JSON 文件加载剧情事实库（多路径容错寻址）"""
-        candidate_paths = [
-            json_path,
-            "assets/daisymo_scenario_memory.json",
-            "daisymo_scenario_memory.json",
-            os.path.join(os.path.dirname(__file__), "assets", "daisymo_scenario_memory.json"),
-            os.path.join(os.path.dirname(__file__), "daisymo_scenario_memory.json")
-        ]
+        """从 JSON 文件加载剧情事实库。
+
+        寻址语义（分两种，这是沙箱干净的关键）：
+        - 显式传入 json_path：只用这一个路径，不存在就留空，绝不回退到真实库 ——
+          测试/沙箱场景据此构造一个「不碰磁盘」的空检索器；
+        - 传入 None（默认）：走多路径容错寻址，加载真实剧情库。
+        """
+        if json_path is not None:
+            candidate_paths = [json_path]
+        else:
+            candidate_paths = [
+                "assets/daisymo_scenario_memory.json",
+                "daisymo_scenario_memory.json",
+                os.path.join(os.path.dirname(__file__), "assets", "daisymo_scenario_memory.json"),
+                os.path.join(os.path.dirname(__file__), "daisymo_scenario_memory.json")
+            ]
         chosen_path = None
         for p in candidate_paths:
             if p and os.path.exists(p):
@@ -148,10 +156,9 @@ class ScenarioMemoryRetriever:
         return "\n".join(lines)
 
 
-# 模块级单例检索器
-_default_retriever = ScenarioMemoryRetriever()
-
-
-def get_scenario_context(query: str, top_k: int = 2) -> str:
-    """获取与输入相关的客观剧情背景事实（未命中返回空字符串）"""
-    return _default_retriever.query_relevant_facts(query, top_k=top_k)
+def build_scenario_retriever(json_path: Optional[str] = None) -> ScenarioMemoryRetriever:
+    """
+    显式构造一个剧情事实检索器。由调用方（DaisyMo）持有，注入后自行管理生命周期，
+    不再依赖 import 时的隐式单例 —— 这样测试能干净地造一个空检索器而不碰磁盘。
+    """
+    return ScenarioMemoryRetriever(json_path)
